@@ -21,7 +21,6 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-# Render Variables
 LICENSE_API_URL = os.environ.get("LICENSE_API_URL", "https://nexus-license.onrender.com")
 CLIENT_ID = os.environ.get("CLIENT_ID", "default_client")
 
@@ -29,21 +28,21 @@ WAITING_FOR_LICENSE, WAITING_FOR_ZIP, WAITING_FOR_REPO = range(3)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('is_verified'):
-        await update.message.reply_text("আপনি ইতোমধ্যে ভেরিফাইড! ZIP ফাইলটি পাঠান।")
+        await update.message.reply_text("Apni itomodhye verified! GitHub-e upload korar jonno apnar project-er ZIP file-ti pathan.")
         return WAITING_FOR_ZIP
 
-    await update.message.reply_text("🔐 আপনার License Key-টি দিন:")
+    await update.message.reply_text("🔐 Ei bot-ti use korar jonno apnar License Key-ti din:")
     return WAITING_FOR_LICENSE
 
 async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_key = update.message.text.strip()
-    await update.message.reply_text("License key verify করা হচ্ছে... ⏳")
+    await update.message.reply_text("License key verify kora hocche... ⏳")
 
-    # Direct Route
+    # Exact API Endpoint provided
     base_domain = LICENSE_API_URL.rstrip('/')
-    endpoint = f"{base_domain}/api/v1/public/verify"
+    endpoint = f"{base_domain}/api/v1/licenses/verify"
 
-    # Exact Schema
+    # Schema based on endpoint requirements
     payload = {
         "clientId": CLIENT_ID,
         "key": user_key,
@@ -65,21 +64,21 @@ async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if response.status_code in [200, 201]:
             context.user_data['is_verified'] = True
-            await update.message.reply_text("✅ License Key Verified!\n\nএখন GitHub-এ আপলোড করার জন্য ZIP ফাইলটি পাঠান।")
+            await update.message.reply_text("✅ License Key Verified!\n\nEbar GitHub-e upload korar jonno ZIP file-ti pathan.")
             return WAITING_FOR_ZIP
         else:
             error_msg = res_data.get("message") or res_data.get("error") or str(res_data)
-            await update.message.reply_text(f"❌ Verification Failed!\n\nServer Response: `{error_msg}`\n\nসঠিক Key দিন বা /cancel লিখুন।", parse_mode="Markdown")
+            await update.message.reply_text(f"❌ Verification Failed!\n\nServer Response: `{error_msg}`\n\nSothik Key din ba /cancel likhun.", parse_mode="Markdown")
             return WAITING_FOR_LICENSE
 
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Network Error: {str(e)}")
+        await update.message.reply_text(f"⚠️️ Network Error: {str(e)}")
         return WAITING_FOR_LICENSE
 
 async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     if not document:
-        await update.message.reply_text("⚠️ অনুগ্রহ করে একটি ZIP ফাইল পাঠান।")
+        await update.message.reply_text("⚠️ Anugroho kore ekta ZIP file pathan.")
         return WAITING_FOR_ZIP
 
     file = await context.bot.get_file(document.file_id)
@@ -88,14 +87,14 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data['zip_path'] = zip_path
     await update.message.reply_text(
-        "ZIP ফাইল পেয়েছি! 📦\n\n"
-        "এখন GitHub Repo-র নাম এবং Path দিন।\n"
-        "ফরম্যাট: `Username/RepositoryName`"
+        "ZIP file peyechi! 📦\n\n"
+        "Ebar GitHub Repo-r naam ebong Path din.\n"
+        "Format: `Username/RepositoryName`"
     )
     return WAITING_FOR_REPO
 
 async def invalid_zip_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚠️ একটি ZIP ফাইল পাঠাতে হবে। (/cancel লিখুন বাতিল করতে)")
+    await update.message.reply_text("⚠️ Ekta ZIP file pathate hobe. (/cancel likhun batil korte)")
     return WAITING_FOR_ZIP
 
 async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,7 +102,7 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = user_input.split('/')
 
     if len(parts) < 2:
-        await update.message.reply_text("ভুল ফরম্যাট! সঠিক ফরম্যাট: `Username/RepositoryName`")
+        await update.message.reply_text("Bhul format! Sothik format: `Username/RepositoryName`")
         return WAITING_FOR_REPO
 
     repo_fullname = f"{parts[0]}/{parts[1]}"
@@ -112,7 +111,7 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     zip_path = context.user_data.get('zip_path')
     extract_dir = "extracted_files"
 
-    await update.message.reply_text("GitHub-এ ফাইল আপলোড শুরু হচ্ছে... ⏳")
+    await update.message.reply_text("GitHub-e file upload shuru hocche... ⏳")
 
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -148,10 +147,10 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if put_response.status_code not in [200, 201]:
                     raise Exception(f"Failed to upload {github_file_path}: {put_response.json().get('message')}")
 
-        await update.message.reply_text(f"সফলভাবে `{repo_fullname}`-এ সব ফাইল আপলোড হয়ে গেছে! ✅")
+        await update.message.reply_text(f"Shofolbhabe `{repo_fullname}`-e shob file upload hoye geche! ✅")
 
     except Exception as e:
-        await update.message.reply_text(f"সমস্যা হয়েছে: {str(e)}")
+        await update.message.reply_text(f"Shomoshya hoyeche: {str(e)}")
 
     finally:
         if os.path.exists(zip_path):
@@ -162,7 +161,7 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("বাতিল করা হয়েছে।")
+    await update.message.reply_text("Batil kora hoyeche.")
     return ConversationHandler.END
 
 def main():
@@ -186,7 +185,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("বট রানিং...✅")
+    print("Bot running...✅")
     app.run_polling()
 
 if __name__ == '__main__':
