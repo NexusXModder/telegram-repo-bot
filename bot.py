@@ -8,6 +8,7 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
+# Flask Keep-Alive Web Server
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
@@ -21,9 +22,9 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-# Correct Base License API URL
+# Base License API URL & Client ID
 LICENSE_API_URL = os.environ.get("LICENSE_API_URL", "https://nexus-license.onrender.com")
-CLIENT_ID = os.environ.get("CLIENT_ID", "")
+CLIENT_ID = os.environ.get("CLIENT_ID", "default_client")
 
 WAITING_FOR_LICENSE, WAITING_FOR_ZIP, WAITING_FOR_REPO = range(3)
 
@@ -40,7 +41,19 @@ async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("License key verify করা হচ্ছে... ⏳")
 
     base_domain = LICENSE_API_URL.rstrip('/')
-    # public.js routes standard paths
+    
+    # Payload exact field format expected by the server
+    payload = {
+        "clientId": CLIENT_ID,
+        "licenseKey": user_key,
+        "deviceToken": f"tg_user_{update.effective_user.id}"
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
     possible_endpoints = [
         f"{base_domain}/api/v1/public/verify",
         f"{base_domain}/api/v1/verify",
@@ -51,36 +64,30 @@ async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_verified = False
     server_msg = ""
 
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    payload = {
-        "client_id": CLIENT_ID,
-        "license_key": user_key,
-        "key": user_key
-    }
-
     for endpoint in possible_endpoints:
         try:
-            # Try POST
-            response = requests.post(endpoint, json=payload, headers=headers, timeout=5)
+            response = requests.post(endpoint, json=payload, headers=headers, timeout=10)
             
-            # Try GET if 404 or 405
-            if response.status_code in [404, 405]:
-                response = requests.get(f"{endpoint}?key={user_key}&client_id={CLIENT_ID}", headers=headers, timeout=5)
+            try:
+                res_data = response.json()
+            except Exception:
+                res_data = {"raw": response.text}
 
             if response.status_code in [200, 201]:
-                res_data = response.json()
-                # Check for validity
-                if res_data.get("status") in ["success", "valid", "active", True] or res_data.get("valid") is True or res_data.get("success") is True:
+                status_val = str(res_data.get("status", "")).lower()
+                valid_val = res_data.get("valid")
+                success_val = res_data.get("success")
+
+                if status_val in ["success", "valid", "active", "true"] or valid_val is True or success_val is True or "license" in res_data:
                     is_verified = True
                     break
                 else:
-                    server_msg = res_data.get("message") or res_data.get("error") or str(res_data)
+                    server_msg = res_data.get("message") or str(res_data)
+            elif response.status_code == 404:
+                continue
             else:
-                try:
-                    res_data = response.json()
-                    server_msg = res_data.get("message") or res_data.get("error") or response.text
-                except Exception:
-                    server_msg = response.text
+                server_msg = res_data.get("message") or str(res_data)
+                break
         except Exception as e:
             server_msg = str(e)
 
