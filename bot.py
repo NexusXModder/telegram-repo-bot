@@ -8,6 +8,7 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
+# Render Web Service-এর জন্য ছোট একটি Flask App
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
@@ -18,67 +19,155 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app_flask.run(host='0.0.0.0', port=port)
 
+# Environment variables থেকে টোকেন নেওয়া
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-LICENSE_API_URL = os.environ.get("LICENSE_API_URL", "https://nexus-license.onrender.com")
-CLIENT_ID = os.environ.get("CLIENT_ID", "default_client")
+LICENSE_API = "https://nexus-license.onrender.com/api/v1/licenses"
+CLIENT_ID = "app_15347417c1994c92997e"
 
-WAITING_FOR_LICENSE, WAITING_FOR_ZIP, WAITING_FOR_REPO = range(3)
+WAITING_FOR_LICENSE = 1
+WAITING_FOR_ZIP = 2
+WAITING_FOR_REPO = 3
+
+
+
+def license_error_message(response):
+    """Return the API's useful error message without crashing on bad JSON."""
+    try:
+        data = response.json()
+    except ValueError:
+        return f"License server error (HTTP {response.status_code}). Please try again later."
+
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = error.get("message")
+        if code == "maintenance":
+            return str(message or "System is under maintenance. Please try again later.")
+        return str(message or "License authentication failed.")
+
+    return f"License server error (HTTP {response.status_code}). Please try again later."
+
+
+def get_device_token(context):
+    return context.user_data.get("license_device_token")
+
+
+async def require_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if get_device_token(context):
+        return True
+    await update.message.reply_text(
+        "🔐 License required.\n\n"
+        "Please send your License Key to continue."
+    )
+    return False
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('is_verified'):
-        await update.message.reply_text("Apni itomodhye verified! GitHub-e upload korar jonno apnar project-er ZIP file-ti pathan.")
+    if get_device_token(context):
+        await update.message.reply_text(
+            "✅ You are already logged in.\n\n"
+            "Send your ZIP file to continue, or use /logout to deactivate this device."
+        )
         return WAITING_FOR_ZIP
 
-    await update.message.reply_text("🔐 Ei bot-ti use korar jonno apnar License Key-ti din:")
+    await update.message.reply_text(
+        "🔐 Nexus License Login\n\n"
+        "Please send your License Key to access this bot."
+    )
     return WAITING_FOR_LICENSE
 
-async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_key = update.message.text.strip()
-    await update.message.reply_text("License key verify kora hocche... ⏳")
 
-    # Exact API Endpoint provided
-    base_domain = LICENSE_API_URL.rstrip('/')
-    endpoint = f"{base_domain}/api/v1/licenses/verify"
-
-    # Schema based on endpoint requirements
-    payload = {
-        "clientId": CLIENT_ID,
-        "key": user_key,
-        "deviceToken": f"tg_user_{update.effective_user.id}"
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-
-    try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=10)
-        
-        try:
-            res_data = response.json()
-        except Exception:
-            res_data = {"raw": response.text}
-
-        if response.status_code in [200, 201]:
-            context.user_data['is_verified'] = True
-            await update.message.reply_text("✅ License Key Verified!\n\nEbar GitHub-e upload korar jonno ZIP file-ti pathan.")
-            return WAITING_FOR_ZIP
-        else:
-            error_msg = res_data.get("message") or res_data.get("error") or str(res_data)
-            await update.message.reply_text(f"❌ Verification Failed!\n\nServer Response: `{error_msg}`\n\nSothik Key din ba /cancel likhun.", parse_mode="Markdown")
-            return WAITING_FOR_LICENSE
-
-    except Exception as e:
-        await update.message.reply_text(f"⚠️️ Network Error: {str(e)}")
+async def handle_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    license_key = (update.message.text or "").strip()
+    if not license_key:
+        await update.message.reply_text("⚠️ Please send a valid License Key.")
         return WAITING_FOR_LICENSE
 
+    user_id = update.effective_user.id
+    fingerprint = f"telegram:{user_id}"
+
+    payload = {
+        "clientId": CLIENT_ID,
+        "licenseKey": license_key,
+        "fingerprint": fingerprint,
+        "deviceLabel": f"Telegram:{user_id}",
+    }
+
+    await update.message.reply_text("🔐 Checking your license...")
+
+    try:
+        response = requests.post(
+            f"{LICENSE_API}/activate",
+            json=payload,
+            timeout=15,
+        )
+
+        if response.ok:
+            data = response.json()
+            token = data.get("data", {}).get("deviceToken")
+            if not token:
+                await update.message.reply_text(
+                    "⚠️ License server returned an unexpected response. Please try again later."
+                )
+                return WAITING_FOR_LICENSE
+
+            context.user_data["license_device_token"] = token
+            context.user_data["license_expires_at"] = data.get("data", {}).get("expiresAt")
+            await update.message.reply_text(
+                "✅ License verified successfully!\n\n"
+                "Now send your ZIP file to continue."
+            )
+            return WAITING_FOR_ZIP
+
+        await update.message.reply_text(
+            f"❌ {license_error_message(response)}"
+        )
+        return WAITING_FOR_LICENSE
+
+    except requests.RequestException:
+        await update.message.reply_text(
+            "❌ Could not connect to the license server. Please try again later."
+        )
+        return WAITING_FOR_LICENSE
+    except Exception:
+        await update.message.reply_text(
+            "❌ An unexpected license error occurred. Please try again later."
+        )
+        return WAITING_FOR_LICENSE
+
+
+async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    token = get_device_token(context)
+    if not token:
+        await update.message.reply_text("ℹ️ You are not logged in.")
+        return ConversationHandler.END
+
+    try:
+        response = requests.post(
+            f"{LICENSE_API}/deactivate",
+            json={"clientId": CLIENT_ID, "deviceToken": token},
+            timeout=15,
+        )
+        if response.ok:
+            context.user_data.pop("license_device_token", None)
+            context.user_data.pop("license_expires_at", None)
+            await update.message.reply_text("✅ License device deactivated.")
+        else:
+            await update.message.reply_text(f"❌ {license_error_message(response)}")
+    except requests.RequestException:
+        await update.message.reply_text("❌ Could not connect to the license server.")
+    return ConversationHandler.END
+
+
 async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+
     document = update.message.document
     if not document:
-        await update.message.reply_text("⚠️ Anugroho kore ekta ZIP file pathan.")
+        await update.message.reply_text("⚠️ এটি কোনো ফাইল নয়! অনুগ্রহ করে গিটহাবে আপলোড করার জন্য একটি ZIP ফাইল পাঠান।")
         return WAITING_FOR_ZIP
 
     file = await context.bot.get_file(document.file_id)
@@ -87,22 +176,27 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data['zip_path'] = zip_path
     await update.message.reply_text(
-        "ZIP file peyechi! 📦\n\n"
-        "Ebar GitHub Repo-r naam ebong Path din.\n"
-        "Format: `Username/RepositoryName`"
+        "ZIP ফাইল পেয়েছি! 📦\n\n"
+        "এখন GitHub Repo-র নাম এবং Path দিন।\n"
+        "ফরম্যাট: `Username/RepositoryName` অথবা `Username/RepositoryName/folder`\n\n"
+        "উদাহরণ: `NexusXModder/my-app` অথবা `NexusXModder/my-app/src`"
     )
     return WAITING_FOR_REPO
 
+# ফাইল না পাঠিয়ে টেক্সট পাঠালে এই ফাংশন উত্তর দেবে
 async def invalid_zip_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚠️ Ekta ZIP file pathate hobe. (/cancel likhun batil korte)")
+    await update.message.reply_text("⚠️ আমি ZIP ফাইলের জন্য অপেক্ষা করছি। অনুগ্রহ করে মেসেজ না পাঠিয়ে একটি ZIP ফাইল অ্যাটাচ করে পাঠান। (বাতিল করতে /cancel লিখুন)")
     return WAITING_FOR_ZIP
 
 async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+
     user_input = update.message.text.strip().strip('/')
     parts = user_input.split('/')
 
     if len(parts) < 2:
-        await update.message.reply_text("Bhul format! Sothik format: `Username/RepositoryName`")
+        await update.message.reply_text("ভুল ফরম্যাট! সঠিক ফরম্যাট: `Username/RepositoryName`")
         return WAITING_FOR_REPO
 
     repo_fullname = f"{parts[0]}/{parts[1]}"
@@ -111,7 +205,7 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     zip_path = context.user_data.get('zip_path')
     extract_dir = "extracted_files"
 
-    await update.message.reply_text("GitHub-e file upload shuru hocche... ⏳")
+    await update.message.reply_text("ফাইল Unzip করা হচ্ছে এবং GitHub-এ আপলোড শুরু হচ্ছে... ⏳")
 
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -135,22 +229,23 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 get_response = requests.get(url, headers=headers)
                 data = {
-                    "message": f"Upload {github_file_path} via Bot",
+                    "message": f"Upload/Update {github_file_path} via Telegram Bot",
                     "content": content_encoded
                 }
 
                 if get_response.status_code == 200:
-                    data['sha'] = get_response.json().get('sha')
+                    sha = get_response.json().get('sha')
+                    data['sha'] = sha
 
                 put_response = requests.put(url, headers=headers, json=data)
 
                 if put_response.status_code not in [200, 201]:
                     raise Exception(f"Failed to upload {github_file_path}: {put_response.json().get('message')}")
 
-        await update.message.reply_text(f"Shofolbhabe `{repo_fullname}`-e shob file upload hoye geche! ✅")
+        await update.message.reply_text(f"সফলভাবে সব ফাইল `{repo_fullname}`-এ আপলোড ও আপডেট হয়ে গেছে! ✅")
 
     except Exception as e:
-        await update.message.reply_text(f"Shomoshya hoyeche: {str(e)}")
+        await update.message.reply_text(f"একটি সমস্যা হয়েছে: {str(e)}")
 
     finally:
         if os.path.exists(zip_path):
@@ -161,7 +256,7 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Batil kora hoyeche.")
+    await update.message.reply_text("প্রসেস বাতিল করা হয়েছে। ❎")
     return ConversationHandler.END
 
 def main():
@@ -172,20 +267,32 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+        entry_points=[
+            CommandHandler('start', start),
+            CommandHandler('login', start),
+            MessageHandler(filters.Document.ALL, handle_zip),
+        ],
         states={
-            WAITING_FOR_LICENSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_license)],
+            WAITING_FOR_LICENSE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_license),
+            ],
             WAITING_FOR_ZIP: [
                 MessageHandler(filters.Document.ALL, handle_zip),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, invalid_zip_input)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, invalid_zip_input),
             ],
-            WAITING_FOR_REPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_repo_info)],
+            WAITING_FOR_REPO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_repo_info),
+            ],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CommandHandler('logout', logout),
+        ],
+        allow_reentry=True,
     )
 
     app.add_handler(conv_handler)
-    print("Bot running...✅")
+    print("বট সফলভাবে চালু হয়েছে...✅")
     app.run_polling()
 
 if __name__ == '__main__':
