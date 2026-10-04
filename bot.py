@@ -8,7 +8,7 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
-# Flask Keep-Alive Web Server
+# Flask Keep-Alive Server
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
@@ -22,7 +22,7 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-# Base License API URL & Client ID
+# API Configuration
 LICENSE_API_URL = os.environ.get("LICENSE_API_URL", "https://nexus-license.onrender.com")
 CLIENT_ID = os.environ.get("CLIENT_ID", "default_client")
 
@@ -30,22 +30,23 @@ WAITING_FOR_LICENSE, WAITING_FOR_ZIP, WAITING_FOR_REPO = range(3)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('is_verified'):
-        await update.message.reply_text("আপনি ইতোমধ্যে ভেরিফাইড! গিটহাবে আপলোড করার জন্য আপনার প্রজেক্টের ZIP ফাইলটি পাঠান।")
+        await update.message.reply_text("Apni itomodhye verified! GitHub-e upload korar jonno apnar project-er ZIP file-ti pathan.")
         return WAITING_FOR_ZIP
 
-    await update.message.reply_text("🔐 এই বটটি ব্যবহার করার জন্য আপনার License Key-টি দিন:")
+    await update.message.reply_text("🔐 Ei bot-ti use korar jonno apnar License Key-ti din:")
     return WAITING_FOR_LICENSE
 
 async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_key = update.message.text.strip()
-    await update.message.reply_text("License key verify করা হচ্ছে... ⏳")
+    await update.message.reply_text("License key verify kora hocche... ⏳")
 
     base_domain = LICENSE_API_URL.rstrip('/')
-    
-    # Payload exact field format expected by the server
+    endpoint = f"{base_domain}/api/v1/public/verify"
+
+    # Exact Zod Schema Payload
     payload = {
         "clientId": CLIENT_ID,
-        "licenseKey": user_key,
+        "key": user_key,
         "deviceToken": f"tg_user_{update.effective_user.id}"
     }
 
@@ -54,55 +55,37 @@ async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Accept": "application/json"
     }
 
-    possible_endpoints = [
-        f"{base_domain}/api/v1/public/verify",
-        f"{base_domain}/api/v1/verify",
-        f"{base_domain}/api/public/verify",
-        f"{base_domain}/api/v1/licenses/verify"
-    ]
-
-    is_verified = False
-    server_msg = ""
-
-    for endpoint in possible_endpoints:
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=10)
+        
         try:
-            response = requests.post(endpoint, json=payload, headers=headers, timeout=10)
-            
-            try:
-                res_data = response.json()
-            except Exception:
-                res_data = {"raw": response.text}
+            res_data = response.json()
+        except Exception:
+            res_data = {"raw": response.text}
 
-            if response.status_code in [200, 201]:
-                status_val = str(res_data.get("status", "")).lower()
-                valid_val = res_data.get("valid")
-                success_val = res_data.get("success")
-
-                if status_val in ["success", "valid", "active", "true"] or valid_val is True or success_val is True or "license" in res_data:
-                    is_verified = True
-                    break
-                else:
-                    server_msg = res_data.get("message") or str(res_data)
-            elif response.status_code == 404:
-                continue
+        if response.status_code in [200, 201] and (res_data.get("ok") is True or res_data.get("success") is True or "license" in res_data):
+            context.user_data['is_verified'] = True
+            await update.message.reply_text("✅ License Key Verified!\n\nEbar GitHub-e upload korar jonno apnar project-er ZIP file-ti pathan.")
+            return WAITING_FOR_ZIP
+        else:
+            # Extracting clean error message from server response
+            error_obj = res_data.get("error", {})
+            if isinstance(error_obj, dict):
+                msg = error_obj.get("message") or str(error_obj)
             else:
-                server_msg = res_data.get("message") or str(res_data)
-                break
-        except Exception as e:
-            server_msg = str(e)
+                msg = res_data.get("message") or str(res_data)
 
-    if is_verified:
-        context.user_data['is_verified'] = True
-        await update.message.reply_text("✅ License Key Verified!\n\nএখন গিটহাবে আপলোড করার জন্য আপনার প্রজেক্টের ZIP ফাইলটি পাঠান।")
-        return WAITING_FOR_ZIP
-    else:
-        await update.message.reply_text(f"❌ Verification Failed!\n\nServer Response: `{server_msg}`\n\nসঠিক Key-টি আবার দিন অথবা /cancel লিখুন।", parse_mode="Markdown")
+            await update.message.reply_text(f"❌ Verification Failed!\n\nServer Response: `{msg}`\n\nSothik Key-ti abar din ba /cancel likhun.", parse_mode="Markdown")
+            return WAITING_FOR_LICENSE
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Network Error: {str(e)}")
         return WAITING_FOR_LICENSE
 
 async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     if not document:
-        await update.message.reply_text("⚠️ এটি কোনো ফাইল নয়! অনুগ্রহ করে একটি ZIP ফাইল পাঠান।")
+        await update.message.reply_text("⚠️ Eita kono file noy! Anugroho kore ekta ZIP file pathan.")
         return WAITING_FOR_ZIP
 
     file = await context.bot.get_file(document.file_id)
@@ -111,14 +94,14 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data['zip_path'] = zip_path
     await update.message.reply_text(
-        "ZIP ফাইল পেয়েছি! 📦\n\n"
-        "এখন GitHub Repo-র নাম এবং Path দিন।\n"
-        "ফরম্যাট: `Username/RepositoryName` অথবা `Username/RepositoryName/folder`"
+        "ZIP file peyechi! 📦\n\n"
+        "Ebar GitHub Repo-r naam ebong Path din.\n"
+        "Format: `Username/RepositoryName` ba `Username/RepositoryName/folder`"
     )
     return WAITING_FOR_REPO
 
 async def invalid_zip_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚠️ আমি ZIP ফাইলের জন্য অপেক্ষা করছি। অনুগ্রহ করে একটি ZIP ফাইল অ্যাটাচ করে পাঠান। (/cancel লিখুন বাতিল করতে)")
+    await update.message.reply_text("⚠️ Ami ZIP file-er jonno opekkha korchi. ZIP file attach kore pathan. (/cancel likhun batil korte)")
     return WAITING_FOR_ZIP
 
 async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,7 +109,7 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = user_input.split('/')
 
     if len(parts) < 2:
-        await update.message.reply_text("ভুল ফরম্যাট! সঠিক ফরম্যাট: `Username/RepositoryName`")
+        await update.message.reply_text("Bhul format! Sothik format: `Username/RepositoryName`")
         return WAITING_FOR_REPO
 
     repo_fullname = f"{parts[0]}/{parts[1]}"
@@ -135,7 +118,7 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     zip_path = context.user_data.get('zip_path')
     extract_dir = "extracted_files"
 
-    await update.message.reply_text("ফাইল Unzip করা হচ্ছে এবং GitHub-এ আপলোড শুরু হচ্ছে... ⏳")
+    await update.message.reply_text("File Unzip kora hocche ebong GitHub-e upload shuru hocche... ⏳")
 
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -172,10 +155,10 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if put_response.status_code not in [200, 201]:
                     raise Exception(f"Failed to upload {github_file_path}: {put_response.json().get('message')}")
 
-        await update.message.reply_text(f"সফলভাবে সব ফাইল `{repo_fullname}`-এ আপলোড ও আপডেট হয়ে গেছে! ✅")
+        await update.message.reply_text(f"Shofolbhabe shob file `{repo_fullname}`-e upload hoye geche! ✅")
 
     except Exception as e:
-        await update.message.reply_text(f"একটি সমস্যা হয়েছে: {str(e)}")
+        await update.message.reply_text(f"Ekta shomoshya hoyeche: {str(e)}")
 
     finally:
         if os.path.exists(zip_path):
@@ -186,7 +169,7 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("প্রসেস বাতিল করা হয়েছে।")
+    await update.message.reply_text("Process batil kora hoyeche.")
     return ConversationHandler.END
 
 def main():
@@ -210,7 +193,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("বট সফলভাবে চালু হয়েছে...✅")
+    print("Bot shofolbhabe chalu hoyeche...✅")
     app.run_polling()
 
 if __name__ == '__main__':
