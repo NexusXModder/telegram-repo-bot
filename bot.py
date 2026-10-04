@@ -8,7 +8,6 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
-# Render Web Service-এর জন্য ছোট একটি Flask App
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
@@ -19,21 +18,55 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app_flask.run(host='0.0.0.0', port=port)
 
-# Environment variables থেকে টোকেন নেওয়া
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-WAITING_FOR_ZIP = 1
-WAITING_FOR_REPO = 2
+# Apnar License Server-er API & Client ID
+LICENSE_API_URL = os.environ.get("LICENSE_API_URL")
+CLIENT_ID = os.environ.get("CLIENT_ID")
+
+WAITING_FOR_LICENSE, WAITING_FOR_ZIP, WAITING_FOR_REPO = range(3)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("স্বাগতম! গিটহাবে আপলোড করার জন্য আপনার প্রজেক্টের ZIP ফাইলটি পাঠান।")
-    return WAITING_FOR_ZIP
+    if context.user_data.get('is_verified'):
+        await update.message.reply_text("Apni alrdy verified! গিটহাবে আপলোড করার জন্য আপনার প্রজেক্টের ZIP ফাইলটি পাঠান।")
+        return WAITING_FOR_ZIP
+
+    await update.message.reply_text("🔐 Ei bot-ti use korar jonno apnar License Key-ti din:")
+    return WAITING_FOR_LICENSE
+
+async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_key = update.message.text.strip()
+    await update.message.reply_text("License key verify kora hocche... ⏳")
+
+    # License API Call
+    payload = {
+        "client_id": CLIENT_ID,
+        "license_key": user_key
+    }
+
+    try:
+        response = requests.post(LICENSE_API_URL, json=payload, timeout=10)
+        res_data = response.json()
+
+        # Api response check (Status code 200 ebong success/valid status)
+        if response.status_code == 200 and (res_data.get("status") == "success" or res_data.get("valid") == True):
+            context.user_data['is_verified'] = True
+            await update.message.reply_text("✅ License Key Verified!\n\nEbar গিটহাবে আপলোড করার জন্য আপনার প্রজেক্টের ZIP ফাইলটি পাঠান।")
+            return WAITING_FOR_ZIP
+        else:
+            msg = res_data.get("message", "Invalid License Key!")
+            await update.message.reply_text(f"❌ Verification Failed: {msg}\nSothik key-ti abar din ba /cancel likhun.")
+            return WAITING_FOR_LICENSE
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ License Server Error: {str(e)}\nAbar chesta korun ba /cancel likhun.")
+        return WAITING_FOR_LICENSE
 
 async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     if not document:
-        await update.message.reply_text("⚠️ এটি কোনো ফাইল নয়! অনুগ্রহ করে গিটহাবে আপলোড করার জন্য একটি ZIP ফাইল পাঠান।")
+        await update.message.reply_text("⚠️ এটি কোনো ফাইল নয়! অনুগ্রহ করে একটি ZIP ফাইল পাঠান।")
         return WAITING_FOR_ZIP
 
     file = await context.bot.get_file(document.file_id)
@@ -44,14 +77,12 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ZIP ফাইল পেয়েছি! 📦\n\n"
         "এখন GitHub Repo-র নাম এবং Path দিন।\n"
-        "ফরম্যাট: `Username/RepositoryName` অথবা `Username/RepositoryName/folder`\n\n"
-        "উদাহরণ: `NexusXModder/my-app` অথবা `NexusXModder/my-app/src`"
+        "ফরম্যাট: `Username/RepositoryName` অথবা `Username/RepositoryName/folder`"
     )
     return WAITING_FOR_REPO
 
-# ফাইল না পাঠিয়ে টেক্সট পাঠালে এই ফাংশন উত্তর দেবে
 async def invalid_zip_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚠️ আমি ZIP ফাইলের জন্য অপেক্ষা করছি। অনুগ্রহ করে মেসেজ না পাঠিয়ে একটি ZIP ফাইল অ্যাটাচ করে পাঠান। (বাতিল করতে /cancel লিখুন)")
+    await update.message.reply_text("⚠️ আমি ZIP ফাইলের জন্য অপেক্ষা করছি। অনুগ্রহ করে একটি ZIP ফাইল অ্যাটাচ করে পাঠান। (/cancel লিখুন বাতিল করতে)")
     return WAITING_FOR_ZIP
 
 async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,7 +150,7 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("প্রসেস বাতিল করা হয়েছে। ❎")
+    await update.message.reply_text("প্রসেস বাতিল করা হয়েছে।")
     return ConversationHandler.END
 
 def main():
@@ -130,14 +161,12 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler('start', start),
-            MessageHandler(filters.Document.ALL, handle_zip)
-        ],
+        entry_points=[CommandHandler('start', start)],
         states={
+            WAITING_FOR_LICENSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_license)],
             WAITING_FOR_ZIP: [
                 MessageHandler(filters.Document.ALL, handle_zip),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, invalid_zip_input) # এখানে ভুল ইনপুটের জন্য হ্যান্ডলার যুক্ত করা হয়েছে
+                MessageHandler(filters.TEXT & ~filters.COMMAND, invalid_zip_input)
             ],
             WAITING_FOR_REPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_repo_info)],
         },
