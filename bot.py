@@ -21,8 +21,8 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-# Apnar License Server API URL & Client ID
-LICENSE_API_URL = os.environ.get("LICENSE_API_URL", "https://nexus-license.onrender.com/api/v1/licenses")
+# Correct Base License API URL
+LICENSE_API_URL = os.environ.get("LICENSE_API_URL", "https://nexus-license.onrender.com")
 CLIENT_ID = os.environ.get("CLIENT_ID", "")
 
 WAITING_FOR_LICENSE, WAITING_FOR_ZIP, WAITING_FOR_REPO = range(3)
@@ -39,56 +39,50 @@ async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_key = update.message.text.strip()
     await update.message.reply_text("License key verify করা হচ্ছে... ⏳")
 
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-
-    payload = {
-        "client_id": CLIENT_ID,
-        "license_key": user_key,
-        "key": user_key,
-        "license": user_key
-    }
+    base_domain = LICENSE_API_URL.rstrip('/')
+    # public.js routes standard paths
+    possible_endpoints = [
+        f"{base_domain}/api/v1/public/verify",
+        f"{base_domain}/api/v1/verify",
+        f"{base_domain}/api/public/verify",
+        f"{base_domain}/api/v1/licenses/verify"
+    ]
 
     is_verified = False
     server_msg = ""
 
-    try:
-        # Step 1: POST Request (JSON Payload)
-        base_url = LICENSE_API_URL.rstrip('/')
-        response = requests.post(base_url, json=payload, headers=headers, timeout=10)
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    payload = {
+        "client_id": CLIENT_ID,
+        "license_key": user_key,
+        "key": user_key
+    }
 
-        # Step 2: POST Response unsuccessful হলে URL Path e Key দিয়ে চেষ্টা করা
-        if response.status_code not in [200, 201]:
-            verify_url = f"{base_url}/{user_key}"
-            response = requests.get(verify_url, headers=headers, params={"client_id": CLIENT_ID}, timeout=10)
-
-        # Response Parse করা
+    for endpoint in possible_endpoints:
         try:
-            res_data = response.json()
-        except Exception:
-            res_data = {"text": response.text}
+            # Try POST
+            response = requests.post(endpoint, json=payload, headers=headers, timeout=5)
+            
+            # Try GET if 404 or 405
+            if response.status_code in [404, 405]:
+                response = requests.get(f"{endpoint}?key={user_key}&client_id={CLIENT_ID}", headers=headers, timeout=5)
 
-        # Response Condition Check
-        if response.status_code in [200, 201]:
-            if isinstance(res_data, dict):
-                status_val = str(res_data.get("status", "")).lower()
-                valid_val = res_data.get("valid")
-                success_val = res_data.get("success")
-                
-                if status_val in ["success", "valid", "active", "true"] or valid_val is True or success_val is True or "license_key" in res_data:
+            if response.status_code in [200, 201]:
+                res_data = response.json()
+                # Check for validity
+                if res_data.get("status") in ["success", "valid", "active", True] or res_data.get("valid") is True or res_data.get("success") is True:
                     is_verified = True
+                    break
                 else:
                     server_msg = res_data.get("message") or res_data.get("error") or str(res_data)
-            elif isinstance(res_data, list):
-                # Response List হলে
-                is_verified = True
-        else:
-            server_msg = res_data.get("message") or res_data.get("error") or response.text
-
-    except Exception as e:
-        server_msg = f"Network Error: {str(e)}"
+            else:
+                try:
+                    res_data = response.json()
+                    server_msg = res_data.get("message") or res_data.get("error") or response.text
+                except Exception:
+                    server_msg = response.text
+        except Exception as e:
+            server_msg = str(e)
 
     if is_verified:
         context.user_data['is_verified'] = True
