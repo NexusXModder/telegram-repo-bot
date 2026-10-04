@@ -21,46 +21,81 @@ def run_flask():
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-# Apnar License Server-er API & Client ID
-LICENSE_API_URL = os.environ.get("LICENSE_API_URL")
-CLIENT_ID = os.environ.get("CLIENT_ID")
+# Apnar License Server API URL & Client ID
+LICENSE_API_URL = os.environ.get("LICENSE_API_URL", "https://nexus-license.onrender.com/api/v1/licenses")
+CLIENT_ID = os.environ.get("CLIENT_ID", "")
 
 WAITING_FOR_LICENSE, WAITING_FOR_ZIP, WAITING_FOR_REPO = range(3)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('is_verified'):
-        await update.message.reply_text("Apni alrdy verified! গিটহাবে আপলোড করার জন্য আপনার প্রজেক্টের ZIP ফাইলটি পাঠান।")
+        await update.message.reply_text("আপনি ইতোমধ্যে ভেরিফাইড! গিটহাবে আপলোড করার জন্য আপনার প্রজেক্টের ZIP ফাইলটি পাঠান।")
         return WAITING_FOR_ZIP
 
-    await update.message.reply_text("🔐 Ei bot-ti use korar jonno apnar License Key-ti din:")
+    await update.message.reply_text("🔐 এই বটটি ব্যবহার করার জন্য আপনার License Key-টি দিন:")
     return WAITING_FOR_LICENSE
 
 async def verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_key = update.message.text.strip()
-    await update.message.reply_text("License key verify kora hocche... ⏳")
+    await update.message.reply_text("License key verify করা হচ্ছে... ⏳")
 
-    # License API Call
-    payload = {
-        "client_id": CLIENT_ID,
-        "license_key": user_key
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
 
-    try:
-        response = requests.post(LICENSE_API_URL, json=payload, timeout=10)
-        res_data = response.json()
+    payload = {
+        "client_id": CLIENT_ID,
+        "license_key": user_key,
+        "key": user_key,
+        "license": user_key
+    }
 
-        # Api response check (Status code 200 ebong success/valid status)
-        if response.status_code == 200 and (res_data.get("status") == "success" or res_data.get("valid") == True):
-            context.user_data['is_verified'] = True
-            await update.message.reply_text("✅ License Key Verified!\n\nEbar গিটহাবে আপলোড করার জন্য আপনার প্রজেক্টের ZIP ফাইলটি পাঠান।")
-            return WAITING_FOR_ZIP
+    is_verified = False
+    server_msg = ""
+
+    try:
+        # Step 1: POST Request (JSON Payload)
+        base_url = LICENSE_API_URL.rstrip('/')
+        response = requests.post(base_url, json=payload, headers=headers, timeout=10)
+
+        # Step 2: POST Response unsuccessful হলে URL Path e Key দিয়ে চেষ্টা করা
+        if response.status_code not in [200, 201]:
+            verify_url = f"{base_url}/{user_key}"
+            response = requests.get(verify_url, headers=headers, params={"client_id": CLIENT_ID}, timeout=10)
+
+        # Response Parse করা
+        try:
+            res_data = response.json()
+        except Exception:
+            res_data = {"text": response.text}
+
+        # Response Condition Check
+        if response.status_code in [200, 201]:
+            if isinstance(res_data, dict):
+                status_val = str(res_data.get("status", "")).lower()
+                valid_val = res_data.get("valid")
+                success_val = res_data.get("success")
+                
+                if status_val in ["success", "valid", "active", "true"] or valid_val is True or success_val is True or "license_key" in res_data:
+                    is_verified = True
+                else:
+                    server_msg = res_data.get("message") or res_data.get("error") or str(res_data)
+            elif isinstance(res_data, list):
+                # Response List হলে
+                is_verified = True
         else:
-            msg = res_data.get("message", "Invalid License Key!")
-            await update.message.reply_text(f"❌ Verification Failed: {msg}\nSothik key-ti abar din ba /cancel likhun.")
-            return WAITING_FOR_LICENSE
+            server_msg = res_data.get("message") or res_data.get("error") or response.text
 
     except Exception as e:
-        await update.message.reply_text(f"⚠️ License Server Error: {str(e)}\nAbar chesta korun ba /cancel likhun.")
+        server_msg = f"Network Error: {str(e)}"
+
+    if is_verified:
+        context.user_data['is_verified'] = True
+        await update.message.reply_text("✅ License Key Verified!\n\nএখন গিটহাবে আপলোড করার জন্য আপনার প্রজেক্টের ZIP ফাইলটি পাঠান।")
+        return WAITING_FOR_ZIP
+    else:
+        await update.message.reply_text(f"❌ Verification Failed!\n\nServer Response: `{server_msg}`\n\nসঠিক Key-টি আবার দিন অথবা /cancel লিখুন।", parse_mode="Markdown")
         return WAITING_FOR_LICENSE
 
 async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
