@@ -33,7 +33,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     if not document:
-        await update.message.reply_text("অনুগ্রহ করে একটি ফাইল পাঠান।")
+        await update.message.reply_text("⚠️ এটি কোনো ফাইল নয়! অনুগ্রহ করে গিটহাবে আপলোড করার জন্য একটি ZIP ফাইল পাঠান।")
         return WAITING_FOR_ZIP
 
     file = await context.bot.get_file(document.file_id)
@@ -48,6 +48,11 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "উদাহরণ: `NexusXModder/my-app` অথবা `NexusXModder/my-app/src`"
     )
     return WAITING_FOR_REPO
+
+# ফাইল না পাঠিয়ে টেক্সট পাঠালে এই ফাংশন উত্তর দেবে
+async def invalid_zip_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⚠️ আমি ZIP ফাইলের জন্য অপেক্ষা করছি। অনুগ্রহ করে মেসেজ না পাঠিয়ে একটি ZIP ফাইল অ্যাটাচ করে পাঠান। (বাতিল করতে /cancel লিখুন)")
+    return WAITING_FOR_ZIP
 
 async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text.strip().strip('/')
@@ -114,16 +119,14 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("প্রসেস বাতিল করা হয়েছে।")
+    await update.message.reply_text("প্রসেস বাতিল করা হয়েছে। ❎")
     return ConversationHandler.END
 
 def main():
-    # Flask ওয়েব সার্ভার আলাদা থ্রেডে চালু করা
     server_thread = Thread(target=run_flask)
     server_thread.daemon = True
     server_thread.start()
 
-    # টেলিগ্রাম বট রান করা
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -132,7 +135,10 @@ def main():
             MessageHandler(filters.Document.ALL, handle_zip)
         ],
         states={
-            WAITING_FOR_ZIP: [MessageHandler(filters.Document.ALL, handle_zip)],
+            WAITING_FOR_ZIP: [
+                MessageHandler(filters.Document.ALL, handle_zip),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, invalid_zip_input) # এখানে ভুল ইনপুটের জন্য হ্যান্ডলার যুক্ত করা হয়েছে
+            ],
             WAITING_FOR_REPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_repo_info)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
