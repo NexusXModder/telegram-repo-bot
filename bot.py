@@ -3,10 +3,23 @@ import zipfile
 import shutil
 import base64
 import requests
+from threading import Thread
+from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
-# Environment variables theke token newa hocche
+# Render Web Service-এর জন্য ছোট একটি Flask App
+app_flask = Flask(__name__)
+
+@app_flask.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app_flask.run(host='0.0.0.0', port=port)
+
+# Environment variables থেকে টোকেন নেওয়া
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
@@ -105,6 +118,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
+    # Flask ওয়েব সার্ভার আলাদা থ্রেডে চালু করা
+    server_thread = Thread(target=run_flask)
+    server_thread.daemon = True
+    server_thread.start()
+
+    # টেলিগ্রাম বট রান করা
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
