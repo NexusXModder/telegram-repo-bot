@@ -43,6 +43,10 @@ WAITING_FOR_REPO = 3
 WAITING_FOR_GITHUB_INPUT = 4
 REPO_PAGE_SIZE = 8
 
+# License sessions are kept per Telegram user so GitHub commands remain
+# authenticated even when a command moves the ConversationHandler between states.
+LICENSE_SESSIONS = {}
+
 
 def github_headers():
     return {
@@ -64,7 +68,23 @@ def license_error_message(response):
 
 
 def get_device_token(context):
-    return context.user_data.get("license_device_token")
+    user = getattr(context, "_license_user_id", None)
+    if user is None:
+        return context.user_data.get("license_device_token")
+    return context.user_data.get("license_device_token") or LICENSE_SESSIONS.get(user)
+
+
+def set_license_session(update, context, token):
+    user_id = update.effective_user.id
+    context.user_data["license_device_token"] = token
+    LICENSE_SESSIONS[user_id] = token
+
+
+def clear_license_session(update, context):
+    user_id = update.effective_user.id
+    context.user_data.pop("license_device_token", None)
+    context.user_data.pop("license_expires_at", None)
+    LICENSE_SESSIONS.pop(user_id, None)
 
 
 def github_error(response):
@@ -142,7 +162,7 @@ async def handle_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not token:
                 await update.message.reply_text("⚠️ License server returned an unexpected response.")
                 return WAITING_FOR_LICENSE
-            context.user_data["license_device_token"] = token
+            set_license_session(update, context, token)
             context.user_data["license_expires_at"] = data.get("data", {}).get("expiresAt")
             await update.message.reply_text(
                 "✅ License verified successfully!\n\n"
@@ -170,7 +190,10 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeout=15,
         )
         if response.ok:
+            clear_license_session(update, context)
+            # Keep any harmless GitHub state out of the session after logout.
             context.user_data.clear()
+            LICENSE_SESSIONS.pop(update.effective_user.id, None)
             await update.message.reply_text("✅ License device deactivated.")
         else:
             await update.message.reply_text(f"❌ {license_error_message(response)}")
