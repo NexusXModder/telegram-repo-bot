@@ -6,7 +6,15 @@ import requests
 from threading import Thread
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+)
 
 # Render Web Service-এর জন্য ছোট একটি Flask App
 app_flask = Flask(__name__)
@@ -29,8 +37,15 @@ CLIENT_ID = "app_15347417c1994c92997e"
 WAITING_FOR_LICENSE = 1
 WAITING_FOR_ZIP = 2
 WAITING_FOR_REPO = 3
-WAITING_FOR_EDIT = 4
+REPO_PAGE_SIZE = 8
 
+
+def github_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
 
 def license_error_message(response):
@@ -58,10 +73,12 @@ def get_device_token(context):
 async def require_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if get_device_token(context):
         return True
-    await update.message.reply_text(
-        "🔐 License required.\n\n"
-        "Please send your License Key to continue."
-    )
+    target = update.effective_message
+    if target:
+        await target.reply_text(
+            "🔐 License required.\n\n"
+            "Please send your License Key to continue."
+        )
     return False
 
 
@@ -122,9 +139,7 @@ async def handle_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return WAITING_FOR_ZIP
 
-        await update.message.reply_text(
-            f"❌ {license_error_message(response)}"
-        )
+        await update.message.reply_text(f"❌ {license_error_message(response)}")
         return WAITING_FOR_LICENSE
 
     except requests.RequestException:
@@ -154,6 +169,8 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if response.ok:
             context.user_data.pop("license_device_token", None)
             context.user_data.pop("license_expires_at", None)
+            context.user_data.pop("zip_path", None)
+            context.user_data.pop("github_repos", None)
             await update.message.reply_text("✅ License device deactivated.")
         else:
             await update.message.reply_text(f"❌ {license_error_message(response)}")
@@ -162,544 +179,282 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def github_error(response):
+    try:
+        data = response.json()
+        return data.get("message") or f"GitHub API error (HTTP {response.status_code})."
+    except ValueError:
+        return f"GitHub API error (HTTP {response.status_code})."
+
+
+def get_repositories():
+    """Fetch all repositories accessible by the configured GitHub token."""
+    repos = []
+    page = 1
+    while True:
+        response = requests.get(
+            "https://api.github.com/user/repos",
+            headers=github_headers(),
+            params={"per_page": 100, "page": page, "sort": "updated", "direction": "desc"},
+            timeout=20,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(github_error(response))
+        batch = response.json()
+        if not batch:
+            break
+        repos.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+        if page > 20:
+            break
+    return repos
+
+
+def repo_picker_keyboard(repos, page=0):
+    start = page * REPO_PAGE_SIZE
+    page_repos = repos[start:start + REPO_PAGE_SIZE]
+    keyboard = []
+
+    for index, repo in enumerate(page_repos, start=start):
+        lock = "🔒" if repo.get("private") else "🌐"
+        name = repo.get("full_name") or repo.get("name") or "Unknown repo"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{lock} {name}",
+                callback_data=f"repo_pick:{index}",
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"repo_page:{page - 1}"))
+    if start + REPO_PAGE_SIZE < len(repos):
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"repo_page:{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([
+        InlineKeyboardButton("🔄 Refresh", callback_data="repo_refresh"),
+        InlineKeyboardButton("❌ Cancel", callback_data="repo_cancel"),
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def show_repo_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0, edit=False):
+    if not GITHUB_TOKEN:
+        text = "❌ GITHUB_TOKEN is not configured on the server."
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(text)
+        else:
+            await update.effective_message.reply_text(text)
+        return WAITING_FOR_ZIP
+
+    try:
+        repos = context.user_data.get("github_repos")
+        if repos is None or page == -1:
+            repos = get_repositories()
+            context.user_data["github_repos"] = repos
+            page = 0
+
+        if not repos:
+            text = "📂 No GitHub repositories were found for this token."
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(text)
+            else:
+                await update.effective_message.reply_text(text)
+            return WAITING_FOR_REPO
+
+        total_pages = (len(repos) + REPO_PAGE_SIZE - 1) // REPO_PAGE_SIZE
+        text = (
+            "📦 ZIP received successfully!\n\n"
+            "📁 Choose the GitHub repository where you want to upload it:\n\n"
+            f"Page {page + 1}/{total_pages} • {len(repos)} repositories"
+        )
+        markup = repo_picker_keyboard(repos, page)
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=markup)
+        else:
+            await update.effective_message.reply_text(text, reply_markup=markup)
+        return WAITING_FOR_REPO
+    except requests.RequestException:
+        text = "❌ Could not connect to GitHub. Please try again."
+    except Exception as exc:
+        text = f"❌ Could not load GitHub repositories.\n\n{exc}"
+
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text)
+    else:
+        await update.effective_message.reply_text(text)
+    return WAITING_FOR_REPO
+
+
 async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_license(update, context):
         return WAITING_FOR_LICENSE
 
     document = update.message.document
     if not document:
-        await update.message.reply_text("⚠️ এটি কোনো ফাইল নয়! অনুগ্রহ করে গিটহাবে আপলোড করার জন্য একটি ZIP ফাইল পাঠান।")
+        await update.message.reply_text(
+            "⚠️ Please send a ZIP file."
+        )
+        return WAITING_FOR_ZIP
+
+    filename = document.file_name or "project.zip"
+    if not filename.lower().endswith(".zip"):
+        await update.message.reply_text("⚠️ Please send a ZIP file (.zip).")
         return WAITING_FOR_ZIP
 
     file = await context.bot.get_file(document.file_id)
-    zip_path = f"temp_{document.file_name}"
+    zip_path = f"temp_{update.effective_user.id}_{filename}"
     await file.download_to_drive(zip_path)
-    
-    context.user_data['zip_path'] = zip_path
-    await update.message.reply_text(
-        "ZIP ফাইল পেয়েছি! 📦\n\n"
-        "এখন GitHub Repo-র নাম এবং Path দিন।\n"
-        "ফরম্যাট: `Username/RepositoryName` অথবা `Username/RepositoryName/folder`\n\n"
-        "উদাহরণ: `NexusXModder/my-app` অথবা `NexusXModder/my-app/src`"
-    )
-    return WAITING_FOR_REPO
 
-# ফাইল না পাঠিয়ে টেক্সট পাঠালে এই ফাংশন উত্তর দেবে
+    context.user_data["zip_path"] = zip_path
+    context.user_data["github_repos"] = None
+
+    return await show_repo_picker(update, context, page=0)
+
+
 async def invalid_zip_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚠️ আমি ZIP ফাইলের জন্য অপেক্ষা করছি। অনুগ্রহ করে মেসেজ না পাঠিয়ে একটি ZIP ফাইল অ্যাটাচ করে পাঠান। (বাতিল করতে /cancel লিখুন)")
+    await update.message.reply_text(
+        "⚠️ Please send a ZIP file, or use /cancel to stop."
+    )
     return WAITING_FOR_ZIP
 
-async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
 
-    user_input = update.message.text.strip().strip('/')
-    parts = user_input.split('/')
-
-    if len(parts) < 2:
-        await update.message.reply_text("ভুল ফরম্যাট! সঠিক ফরম্যাট: `Username/RepositoryName`")
+async def repo_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        page = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("Invalid page.", show_alert=True)
         return WAITING_FOR_REPO
+    return await show_repo_picker(update, context, page=page, edit=True)
 
-    repo_fullname = f"{parts[0]}/{parts[1]}"
-    target_path = "/".join(parts[2:]) if len(parts) > 2 else ""
 
-    zip_path = context.user_data.get('zip_path')
-    extract_dir = "extracted_files"
+async def repo_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Refreshing repositories...")
+    return await show_repo_picker(update, context, page=-1, edit=True)
 
-    await update.message.reply_text("ফাইল Unzip করা হচ্ছে এবং GitHub-এ আপলোড শুরু হচ্ছে... ⏳")
 
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
+async def repo_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    zip_path = context.user_data.pop("zip_path", None)
+    context.user_data.pop("github_repos", None)
+    if zip_path and os.path.exists(zip_path):
+        os.remove(zip_path)
+    await query.edit_message_text("❎ Upload cancelled.")
+    return ConversationHandler.END
+
+
+async def repo_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Repository selected.")
 
     try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        index = int(query.data.split(":", 1)[1])
+        repos = context.user_data.get("github_repos") or []
+        repo = repos[index]
+    except (ValueError, IndexError, TypeError):
+        await query.edit_message_text("❌ That repository selection is no longer available. Please send the ZIP again.")
+        return ConversationHandler.END
+
+    repo_fullname = repo.get("full_name")
+    if not repo_fullname:
+        await query.edit_message_text("❌ Could not determine the selected repository.")
+        return ConversationHandler.END
+
+    zip_path = context.user_data.get("zip_path")
+    if not zip_path or not os.path.exists(zip_path):
+        await query.edit_message_text("❌ ZIP file is no longer available. Please send it again.")
+        return WAITING_FOR_ZIP
+
+    await query.edit_message_text(
+        f"📤 Uploading to `{repo_fullname}`...\n\nPlease wait ⏳",
+        parse_mode="Markdown",
+    )
+
+    extract_dir = f"extracted_{update.effective_user.id}"
+    headers = github_headers()
+    uploaded = 0
+    skipped = 0
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            bad = zip_ref.testzip()
+            if bad:
+                raise RuntimeError(f"The ZIP file is corrupted near: {bad}")
             zip_ref.extractall(extract_dir)
 
         for root, _, files in os.walk(extract_dir):
-            # Never upload Python cache or compiled files.
-            files = [f for f in files if f != "__pycache__" and not f.endswith((".pyc", ".pyo"))]
             for file_name in files:
                 local_file_path = os.path.join(root, file_name)
-                if "__pycache__" in local_file_path.split(os.sep):
-                    continue
                 relative_path = os.path.relpath(local_file_path, extract_dir).replace("\\", "/")
-                
-                github_file_path = f"{target_path}/{relative_path}" if target_path else relative_path
-                url = f"https://api.github.com/repos/{repo_fullname}/contents/{github_file_path}"
 
-                with open(local_file_path, 'rb') as f:
-                    content_encoded = base64.b64encode(f.read()).decode('utf-8')
+                # Python cache / VCS metadata should never be uploaded.
+                parts = relative_path.split("/")
+                if "__pycache__" in parts or file_name.endswith((".pyc", ".pyo")) or ".git" in parts:
+                    skipped += 1
+                    continue
 
-                get_response = requests.get(url, headers=headers)
+                url = f"https://api.github.com/repos/{repo_fullname}/contents/{relative_path}"
+                with open(local_file_path, "rb") as f:
+                    content_encoded = base64.b64encode(f.read()).decode("utf-8")
+
+                get_response = requests.get(url, headers=headers, timeout=20)
                 data = {
-                    "message": f"Upload/Update {github_file_path} via Telegram Bot",
-                    "content": content_encoded
+                    "message": f"Upload/Update {relative_path} via Telegram Bot",
+                    "content": content_encoded,
                 }
 
                 if get_response.status_code == 200:
-                    sha = get_response.json().get('sha')
-                    data['sha'] = sha
+                    sha = get_response.json().get("sha")
+                    if sha:
+                        data["sha"] = sha
+                elif get_response.status_code != 404:
+                    raise RuntimeError(f"Could not check {relative_path}: {github_error(get_response)}")
 
-                put_response = requests.put(url, headers=headers, json=data)
+                put_response = requests.put(url, headers=headers, json=data, timeout=30)
+                if put_response.status_code not in (200, 201):
+                    raise RuntimeError(f"Failed to upload {relative_path}: {github_error(put_response)}")
+                uploaded += 1
 
-                if put_response.status_code not in [200, 201]:
-                    raise Exception(f"Failed to upload {github_file_path}: {put_response.json().get('message')}")
-
-        await update.message.reply_text(f"সফলভাবে সব ফাইল `{repo_fullname}`-এ আপলোড ও আপডেট হয়ে গেছে! ✅")
-
-    except Exception as e:
-        await update.message.reply_text(f"একটি সমস্যা হয়েছে: {str(e)}")
-
+        await query.edit_message_text(
+            f"✅ Upload complete!\n\n"
+            f"📦 Repository: `{repo_fullname}`\n"
+            f"📄 Files uploaded/updated: {uploaded}\n"
+            f"⏭️ Cache files skipped: {skipped}",
+            parse_mode="Markdown",
+        )
+    except zipfile.BadZipFile:
+        await query.edit_message_text("❌ Invalid or corrupted ZIP file.")
+    except requests.RequestException:
+        await query.edit_message_text("❌ Could not connect to GitHub while uploading.")
+    except Exception as exc:
+        await query.edit_message_text(f"❌ Upload failed:\n\n{exc}")
     finally:
         if os.path.exists(zip_path):
             os.remove(zip_path)
         if os.path.exists(extract_dir):
             shutil.rmtree(extract_dir)
+        context.user_data.pop("zip_path", None)
+        context.user_data.pop("github_repos", None)
 
     return ConversationHandler.END
 
-
-# =========================
-# GitHub A-Z management
-# =========================
-GITHUB_API = "https://api.github.com"
-
-
-def github_headers():
-    return {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-def github_error(response):
-    try:
-        data = response.json()
-        return data.get("message", f"GitHub API error (HTTP {response.status_code})")
-    except ValueError:
-        return f"GitHub API error (HTTP {response.status_code})"
-
-
-def parse_repo(value):
-    value = value.strip().strip("/")
-    parts = value.split("/")
-    if len(parts) != 2 or not all(parts):
-        return None
-    return parts[0], parts[1]
-
-
-def github_ready():
-    return bool(GITHUB_TOKEN)
-
-
-async def github_guard(update: Update):
-    if not await require_license(update, update.get_bot().application.user_data if False else update.get_bot()):
-        return False
-    return True
-
-
-async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    if not github_ready():
-        await update.message.reply_text("❌ GITHUB_TOKEN Render Environment-এ পাওয়া যায়নি।")
-        return ConversationHandler.END
-    try:
-        r = requests.get(f"{GITHUB_API}/user/repos?per_page=100&sort=updated", headers=github_headers(), timeout=15)
-        if not r.ok:
-            await update.message.reply_text(f"❌ {github_error(r)}")
-            return ConversationHandler.END
-        items = r.json()
-        if not items:
-            await update.message.reply_text("📂 কোনো repository পাওয়া যায়নি।")
-            return ConversationHandler.END
-        lines = ["📚 Your GitHub Repositories:\n"]
-        for x in items[:100]:
-            visibility = "🔒 Private" if x.get("private") else "🌐 Public"
-            lines.append(f"• `{x['full_name']}` — {visibility}")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except requests.RequestException as e:
-        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
-    return ConversationHandler.END
-
-
-async def create_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    if not github_ready():
-        await update.message.reply_text("❌ GITHUB_TOKEN Render Environment-এ পাওয়া যায়নি।")
-        return ConversationHandler.END
-    if not context.args or len(context.args) > 2:
-        await update.message.reply_text("Usage:\n/create_repo RepoName [private|public]\n\nExample:\n/create_repo my-project private")
-        return ConversationHandler.END
-    name = context.args[0]
-    private = len(context.args) == 2 and context.args[1].lower() == "private"
-    payload = {"name": name, "private": private, "auto_init": False}
-    try:
-        r = requests.post(f"{GITHUB_API}/user/repos", headers=github_headers(), json=payload, timeout=15)
-        if r.status_code == 201:
-            data = r.json()
-            await update.message.reply_text(f"✅ Repository created!\n\n📦 `{data['full_name']}`\n🔗 {data['html_url']}", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"❌ {github_error(r)}")
-    except requests.RequestException as e:
-        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
-    return ConversationHandler.END
-
-
-async def delete_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    if not github_ready():
-        await update.message.reply_text("❌ GITHUB_TOKEN Render Environment-এ পাওয়া যায়নি।")
-        return ConversationHandler.END
-    if len(context.args) != 2 or context.args[1].upper() != "CONFIRM":
-        await update.message.reply_text("⚠️ Repository permanently delete করতে:\n/delete_repo owner/repo CONFIRM")
-        return ConversationHandler.END
-    repo = parse_repo(context.args[0])
-    if not repo:
-        await update.message.reply_text("❌ Format: owner/repo")
-        return ConversationHandler.END
-    try:
-        r = requests.delete(f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}", headers=github_headers(), timeout=15)
-        if r.status_code == 204:
-            await update.message.reply_text(f"🗑️ `{repo[0]}/{repo[1]}` deleted successfully.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"❌ {github_error(r)}")
-    except requests.RequestException as e:
-        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
-    return ConversationHandler.END
-
-
-async def repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /repo_info owner/repo")
-        return ConversationHandler.END
-    repo = parse_repo(context.args[0])
-    if not repo:
-        await update.message.reply_text("❌ Format: owner/repo")
-        return ConversationHandler.END
-    try:
-        r = requests.get(f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}", headers=github_headers(), timeout=15)
-        if not r.ok:
-            await update.message.reply_text(f"❌ {github_error(r)}")
-            return ConversationHandler.END
-        d = r.json()
-        await update.message.reply_text(
-            f"📦 {d['full_name']}\n\n"
-            f"🔒 {'Private' if d['private'] else 'Public'}\n"
-            f"⭐ {d['stargazers_count']}\n"
-            f"🌿 Default branch: `{d['default_branch']}`\n"
-            f"📁 {d.get('size', 0)} KB\n"
-            f"🔗 {d['html_url']}", parse_mode="Markdown")
-    except requests.RequestException as e:
-        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
-    return ConversationHandler.END
-
-
-async def browse_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    if len(context.args) not in (1, 2):
-        await update.message.reply_text("Usage: /browse owner/repo [folder/path]")
-        return ConversationHandler.END
-    repo = parse_repo(context.args[0])
-    if not repo:
-        await update.message.reply_text("❌ Format: owner/repo")
-        return ConversationHandler.END
-    path = context.args[1] if len(context.args) == 2 else ""
-    try:
-        url = f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}/contents/{path}" if path else f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}/contents"
-        r = requests.get(url, headers=github_headers(), timeout=15)
-        if not r.ok:
-            await update.message.reply_text(f"❌ {github_error(r)}")
-            return ConversationHandler.END
-        data = r.json()
-        if isinstance(data, dict):
-            await update.message.reply_text(f"📄 `{data.get('path')}`\n🔗 {data.get('html_url')}", parse_mode="Markdown")
-            return ConversationHandler.END
-        lines = [f"📂 `{repo[0]}/{repo[1]}/{path}`" if path else f"📂 `{repo[0]}/{repo[1]}`", ""]
-        for x in data:
-            icon = "📁" if x.get("type") == "dir" else "📄"
-            lines.append(f"{icon} `{x.get('path')}`")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except requests.RequestException as e:
-        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
-    return ConversationHandler.END
-
-
-async def view_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /view_file owner/repo/path/to/file")
-        return ConversationHandler.END
-    repo = parse_repo(context.args[0])
-    if not repo:
-        await update.message.reply_text("❌ Format: owner/repo")
-        return ConversationHandler.END
-    path = context.args[1]
-    try:
-        r = requests.get(f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}/contents/{path}", headers=github_headers(), timeout=15)
-        if not r.ok:
-            await update.message.reply_text(f"❌ {github_error(r)}")
-            return ConversationHandler.END
-        d = r.json()
-        if d.get("encoding") != "base64":
-            await update.message.reply_text("❌ This file cannot be displayed as text.")
-            return ConversationHandler.END
-        content = base64.b64decode(d["content"]).decode("utf-8", errors="replace")
-        if len(content) > 3500:
-            content = content[:3500] + "\n... [truncated]"
-        await update.message.reply_text(f"📄 `{path}`\n\n```text\n{content}\n```", parse_mode="Markdown")
-    except (requests.RequestException, ValueError) as e:
-        await update.message.reply_text(f"❌ Could not read file: {e}")
-    return ConversationHandler.END
-
-
-async def edit_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /edit_file owner/repo path/to/file")
-        return ConversationHandler.END
-    repo = parse_repo(context.args[0])
-    if not repo:
-        await update.message.reply_text("❌ Format: owner/repo")
-        return ConversationHandler.END
-    context.user_data["edit_repo"] = f"{repo[0]}/{repo[1]}"
-    context.user_data["edit_path"] = context.args[1]
-    await update.message.reply_text("✏️ এখন নতুন file content পাঠাও। এই message-টাই পুরো file replace করবে।\n\n/cancel দিয়ে বাতিল করতে পারো।")
-    return WAITING_FOR_EDIT
-
-
-async def edit_file_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    repo = context.user_data.get("edit_repo")
-    path = context.user_data.get("edit_path")
-    if not repo or not path:
-        return ConversationHandler.END
-    try:
-        owner, name = repo.split("/", 1)
-        url = f"{GITHUB_API}/repos/{owner}/{name}/contents/{path}"
-        old = requests.get(url, headers=github_headers(), timeout=15)
-        sha = old.json().get("sha") if old.status_code == 200 else None
-        payload = {"message": f"Edit {path} via Telegram Bot", "content": base64.b64encode((update.message.text or "").encode()).decode()}
-        if sha:
-            payload["sha"] = sha
-        r = requests.put(url, headers=github_headers(), json=payload, timeout=15)
-        if r.status_code in (200, 201):
-            await update.message.reply_text(f"✅ `{path}` updated successfully.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"❌ {github_error(r)}")
-    except requests.RequestException as e:
-        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
-    finally:
-        context.user_data.pop("edit_repo", None)
-        context.user_data.pop("edit_path", None)
-    return ConversationHandler.END
-
-
-async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    if len(context.args) != 3 or context.args[2].upper() != "CONFIRM":
-        await update.message.reply_text("⚠️ File permanently delete করতে:\n/delete_file owner/repo path/to/file CONFIRM")
-        return ConversationHandler.END
-    repo = parse_repo(context.args[0])
-    if not repo:
-        await update.message.reply_text("❌ Format: owner/repo")
-        return ConversationHandler.END
-    path = context.args[1]
-    try:
-        url = f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}/contents/{path}"
-        old = requests.get(url, headers=github_headers(), timeout=15)
-        if old.status_code != 200:
-            await update.message.reply_text(f"❌ {github_error(old)}")
-            return ConversationHandler.END
-        sha = old.json().get("sha")
-        r = requests.delete(url, headers=github_headers(), json={"message": f"Delete {path} via Telegram Bot", "sha": sha}, timeout=15)
-        if r.status_code == 200:
-            await update.message.reply_text(f"🗑️ `{path}` deleted successfully.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"❌ {github_error(r)}")
-    except requests.RequestException as e:
-        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
-    return ConversationHandler.END
-
-
-async def visibility_menu_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    r = requests.get(f"{GITHUB_API}/user/repos?per_page=100&sort=updated", headers=github_headers(), timeout=15)
-    if not r.ok:
-        await update.message.reply_text(f"❌ {github_error(r)}")
-        return
-    repos = r.json()
-    if not repos:
-        await update.message.reply_text("ℹ️ No repositories found.")
-        return
-    context.user_data["visibility_repos"] = [x["full_name"] for x in repos]
-    keyboard = []
-    for i, x in enumerate(repos):
-        status = "🔒" if x.get("private") else "🌐"
-        keyboard.append([InlineKeyboardButton(f"{status} {x['name']}", callback_data=f"visrepo:{i}")])
-    await update.message.reply_text("Select a repository:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def visibility_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    r = requests.get(f"{GITHUB_API}/user/repos?per_page=100&sort=updated", headers=github_headers(), timeout=15)
-    if not r.ok:
-        await query.edit_message_text(f"❌ {github_error(r)}")
-        return
-    repos = r.json()
-    if not repos:
-        await query.edit_message_text("ℹ️ No repositories found.")
-        return
-    context.user_data["visibility_repos"] = [x["full_name"] for x in repos]
-    keyboard = []
-    for i, x in enumerate(repos):
-        status = "🔒" if x.get("private") else "🌐"
-        keyboard.append([InlineKeyboardButton(f"{status} {x['name']}", callback_data=f"visrepo:{i}")])
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="gh:cancel")])
-    await query.edit_message_text("Select a repository:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def visibility_repo_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    try:
-        idx = int(query.data.split(":", 1)[1])
-        full_name = context.user_data["visibility_repos"][idx]
-    except (ValueError, IndexError, KeyError):
-        await query.edit_message_text("❌ Selection expired. Send /visibility again.")
-        return
-    context.user_data["visibility_selected"] = full_name
-    keyboard = [[
-        InlineKeyboardButton("🌐 Public", callback_data="visset:public"),
-        InlineKeyboardButton("🔒 Private", callback_data="visset:private"),
-    ], [InlineKeyboardButton("⬅️ Back", callback_data="gh:visibility")]]
-    await query.edit_message_text(
-        f"Repository: `{full_name}`\n\nChoose visibility:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def visibility_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    full_name = context.user_data.get("visibility_selected")
-    if not full_name or "/" not in full_name:
-        await query.edit_message_text("❌ Selection expired. Send /visibility again.")
-        return
-    mode = query.data.split(":", 1)[1]
-    owner, repo = full_name.split("/", 1)
-    r = requests.patch(
-        f"{GITHUB_API}/repos/{owner}/{repo}",
-        headers=github_headers(),
-        json={"private": mode == "private"},
-        timeout=15,
-    )
-    if r.ok:
-        await query.edit_message_text(f"✅ `{full_name}` is now {'Private 🔒' if mode == 'private' else 'Public 🌐'}.", parse_mode="Markdown")
-    else:
-        await query.edit_message_text(f"❌ {github_error(r)}")
-
-
-async def github_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    keyboard = [
-        [InlineKeyboardButton("📚 Repositories", callback_data="gh:repos"), InlineKeyboardButton("➕ Create Repo", callback_data="gh:create")],
-        [InlineKeyboardButton("🔐 Visibility", callback_data="gh:visibility"), InlineKeyboardButton("ℹ️ Repo Info", callback_data="gh:info")],
-        [InlineKeyboardButton("📂 Browse", callback_data="gh:browse"), InlineKeyboardButton("👁 View File", callback_data="gh:view")],
-        [InlineKeyboardButton("✏️ Edit File", callback_data="gh:edit"), InlineKeyboardButton("🗑 Delete File", callback_data="gh:deletefile")],
-        [InlineKeyboardButton("🗑 Delete Repo", callback_data="gh:deleterepo")],
-    ]
-    await update.message.reply_text("🐙 GitHub Manager\n\nTap an option below, or use commands manually.", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def github_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    if data == "gh:visibility":
-        await visibility_menu(update, context)
-        return
-    if data.startswith("visrepo:"):
-        await visibility_repo_menu(update, context)
-        return
-    if data.startswith("visset:"):
-        await visibility_set_callback(update, context)
-        return
-    await query.answer()
-    prompts = {
-        "gh:create": "Type: /create_repo RepoName private|public",
-        "gh:info": "Type: /repo_info owner/repo",
-        "gh:browse": "Type: /browse owner/repo [folder]",
-        "gh:view": "Type: /view_file owner/repo path/to/file",
-        "gh:edit": "Type: /edit_file owner/repo path/to/file",
-        "gh:deletefile": "Type: /delete_file owner/repo path/to/file CONFIRM",
-        "gh:deleterepo": "Type: /delete_repo owner/repo CONFIRM",
-        "gh:repos": "Use /repos to list repositories.",
-    }
-    if data == "gh:cancel":
-        await query.edit_message_text("Cancelled.")
-    elif data in prompts:
-        await query.edit_message_text(prompts[data])
-
-
-async def set_visibility(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    if len(context.args) == 0:
-        await visibility_menu_from_message(update, context)
-        return ConversationHandler.END
-    if len(context.args) != 2 or context.args[1].lower() not in ("public", "private"):
-        await update.message.reply_text("Use /visibility without arguments to tap a repository, or /visibility owner/repo public|private")
-        return ConversationHandler.END
-    repo = parse_repo(context.args[0])
-    if not repo:
-        await update.message.reply_text("❌ Format: owner/repo")
-        return ConversationHandler.END
-    try:
-        r = requests.patch(f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}", headers=github_headers(), json={"private": context.args[1].lower() == "private"}, timeout=15)
-        if r.ok:
-            await update.message.reply_text(f"✅ `{repo[0]}/{repo[1]}` is now {context.args[1].lower()}.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"❌ {github_error(r)}")
-    except requests.RequestException as e:
-        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
-    return ConversationHandler.END
-
-
-async def github_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_license(update, context):
-        return WAITING_FOR_LICENSE
-    await update.message.reply_text(
-        "🐙 GitHub Manager\n\n"
-        "/repos — list repositories\n"
-        "/create_repo name [private|public] — create repo\n"
-        "/delete_repo owner/repo CONFIRM — delete repo\n"
-        "/repo_info owner/repo — repo details\n"
-        "/browse owner/repo [folder] — browse files\n"
-        "/view_file owner/repo path — view file\n"
-        "/edit_file owner/repo path — replace file content\n"
-        "/delete_file owner/repo path CONFIRM — delete file\n"
-        "/visibility owner/repo public|private — change visibility\n\n"
-        "📦 Send a ZIP normally to upload/update an entire project."
-    )
-    return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    zip_path = context.user_data.pop("zip_path", None)
+    context.user_data.pop("github_repos", None)
+    if zip_path and os.path.exists(zip_path):
+        os.remove(zip_path)
     await update.message.reply_text("প্রসেস বাতিল করা হয়েছে। ❎")
     return ConversationHandler.END
+
 
 def main():
     server_thread = Thread(target=run_flask)
@@ -707,18 +462,6 @@ def main():
     server_thread.start()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # GitHub management commands are added only once here.
-    # Existing ZIP upload/license flow remains unchanged.
-    github_commands = [
-        ("github", github_menu), ("repos", repos), ("create_repo", create_repo),
-        ("delete_repo", delete_repo), ("repo_info", repo_info), ("browse", browse_repo),
-        ("view_file", view_file), ("edit_file", edit_file_start), ("delete_file", delete_file),
-        ("visibility", set_visibility),
-    ]
-    for command, handler in github_commands:
-        app.add_handler(CommandHandler(command, handler))
-    app.add_handler(CallbackQueryHandler(github_callback_router, pattern=r"^(gh:|visrepo:|visset:).+"))
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -735,10 +478,12 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, invalid_zip_input),
             ],
             WAITING_FOR_REPO: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_repo_info),
-            ],
-            WAITING_FOR_EDIT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_file_finish),
+                CallbackQueryHandler(repo_pick_callback, pattern=r"^repo_pick:\d+$"),
+                CallbackQueryHandler(repo_page_callback, pattern=r"^repo_page:\d+$"),
+                CallbackQueryHandler(repo_refresh_callback, pattern=r"^repo_refresh$"),
+                CallbackQueryHandler(repo_cancel_callback, pattern=r"^repo_cancel$"),
+                MessageHandler(filters.Document.ALL, handle_zip),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, invalid_zip_input),
             ],
         },
         fallbacks=[
@@ -751,6 +496,7 @@ def main():
     app.add_handler(conv_handler)
     print("বট সফলভাবে চালু হয়েছে...✅")
     app.run_polling()
+
 
 if __name__ == '__main__':
     main()
