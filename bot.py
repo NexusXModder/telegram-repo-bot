@@ -5,8 +5,8 @@ import base64
 import requests
 from threading import Thread
 from flask import Flask
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 
 # Render Web Service-এর জন্য ছোট একটি Flask App
 app_flask = Flask(__name__)
@@ -534,11 +534,135 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def visibility_menu_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = requests.get(f"{GITHUB_API}/user/repos?per_page=100&sort=updated", headers=github_headers(), timeout=15)
+    if not r.ok:
+        await update.message.reply_text(f"❌ {github_error(r)}")
+        return
+    repos = r.json()
+    if not repos:
+        await update.message.reply_text("ℹ️ No repositories found.")
+        return
+    context.user_data["visibility_repos"] = [x["full_name"] for x in repos]
+    keyboard = []
+    for i, x in enumerate(repos):
+        status = "🔒" if x.get("private") else "🌐"
+        keyboard.append([InlineKeyboardButton(f"{status} {x['name']}", callback_data=f"visrepo:{i}")])
+    await update.message.reply_text("Select a repository:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def visibility_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    r = requests.get(f"{GITHUB_API}/user/repos?per_page=100&sort=updated", headers=github_headers(), timeout=15)
+    if not r.ok:
+        await query.edit_message_text(f"❌ {github_error(r)}")
+        return
+    repos = r.json()
+    if not repos:
+        await query.edit_message_text("ℹ️ No repositories found.")
+        return
+    context.user_data["visibility_repos"] = [x["full_name"] for x in repos]
+    keyboard = []
+    for i, x in enumerate(repos):
+        status = "🔒" if x.get("private") else "🌐"
+        keyboard.append([InlineKeyboardButton(f"{status} {x['name']}", callback_data=f"visrepo:{i}")])
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="gh:cancel")])
+    await query.edit_message_text("Select a repository:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def visibility_repo_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        idx = int(query.data.split(":", 1)[1])
+        full_name = context.user_data["visibility_repos"][idx]
+    except (ValueError, IndexError, KeyError):
+        await query.edit_message_text("❌ Selection expired. Send /visibility again.")
+        return
+    context.user_data["visibility_selected"] = full_name
+    keyboard = [[
+        InlineKeyboardButton("🌐 Public", callback_data="visset:public"),
+        InlineKeyboardButton("🔒 Private", callback_data="visset:private"),
+    ], [InlineKeyboardButton("⬅️ Back", callback_data="gh:visibility")]]
+    await query.edit_message_text(
+        f"Repository: `{full_name}`\n\nChoose visibility:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def visibility_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    full_name = context.user_data.get("visibility_selected")
+    if not full_name or "/" not in full_name:
+        await query.edit_message_text("❌ Selection expired. Send /visibility again.")
+        return
+    mode = query.data.split(":", 1)[1]
+    owner, repo = full_name.split("/", 1)
+    r = requests.patch(
+        f"{GITHUB_API}/repos/{owner}/{repo}",
+        headers=github_headers(),
+        json={"private": mode == "private"},
+        timeout=15,
+    )
+    if r.ok:
+        await query.edit_message_text(f"✅ `{full_name}` is now {'Private 🔒' if mode == 'private' else 'Public 🌐'}.", parse_mode="Markdown")
+    else:
+        await query.edit_message_text(f"❌ {github_error(r)}")
+
+
+async def github_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    keyboard = [
+        [InlineKeyboardButton("📚 Repositories", callback_data="gh:repos"), InlineKeyboardButton("➕ Create Repo", callback_data="gh:create")],
+        [InlineKeyboardButton("🔐 Visibility", callback_data="gh:visibility"), InlineKeyboardButton("ℹ️ Repo Info", callback_data="gh:info")],
+        [InlineKeyboardButton("📂 Browse", callback_data="gh:browse"), InlineKeyboardButton("👁 View File", callback_data="gh:view")],
+        [InlineKeyboardButton("✏️ Edit File", callback_data="gh:edit"), InlineKeyboardButton("🗑 Delete File", callback_data="gh:deletefile")],
+        [InlineKeyboardButton("🗑 Delete Repo", callback_data="gh:deleterepo")],
+    ]
+    await update.message.reply_text("🐙 GitHub Manager\n\nTap an option below, or use commands manually.", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def github_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    if data == "gh:visibility":
+        await visibility_menu(update, context)
+        return
+    if data.startswith("visrepo:"):
+        await visibility_repo_menu(update, context)
+        return
+    if data.startswith("visset:"):
+        await visibility_set_callback(update, context)
+        return
+    await query.answer()
+    prompts = {
+        "gh:create": "Type: /create_repo RepoName private|public",
+        "gh:info": "Type: /repo_info owner/repo",
+        "gh:browse": "Type: /browse owner/repo [folder]",
+        "gh:view": "Type: /view_file owner/repo path/to/file",
+        "gh:edit": "Type: /edit_file owner/repo path/to/file",
+        "gh:deletefile": "Type: /delete_file owner/repo path/to/file CONFIRM",
+        "gh:deleterepo": "Type: /delete_repo owner/repo CONFIRM",
+        "gh:repos": "Use /repos to list repositories.",
+    }
+    if data == "gh:cancel":
+        await query.edit_message_text("Cancelled.")
+    elif data in prompts:
+        await query.edit_message_text(prompts[data])
+
+
 async def set_visibility(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_license(update, context):
         return WAITING_FOR_LICENSE
+    if len(context.args) == 0:
+        await visibility_menu_from_message(update, context)
+        return ConversationHandler.END
     if len(context.args) != 2 or context.args[1].lower() not in ("public", "private"):
-        await update.message.reply_text("Usage: /visibility owner/repo public|private")
+        await update.message.reply_text("Use /visibility without arguments to tap a repository, or /visibility owner/repo public|private")
         return ConversationHandler.END
     repo = parse_repo(context.args[0])
     if not repo:
@@ -587,13 +711,14 @@ def main():
     # GitHub management commands are added only once here.
     # Existing ZIP upload/license flow remains unchanged.
     github_commands = [
-        ("github", github_help), ("repos", repos), ("create_repo", create_repo),
+        ("github", github_menu), ("repos", repos), ("create_repo", create_repo),
         ("delete_repo", delete_repo), ("repo_info", repo_info), ("browse", browse_repo),
         ("view_file", view_file), ("edit_file", edit_file_start), ("delete_file", delete_file),
         ("visibility", set_visibility),
     ]
     for command, handler in github_commands:
         app.add_handler(CommandHandler(command, handler))
+    app.add_handler(CallbackQueryHandler(github_callback_router, pattern=r"^(gh:|visrepo:|visset:).+"))
 
     conv_handler = ConversationHandler(
         entry_points=[
