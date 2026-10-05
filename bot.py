@@ -29,6 +29,7 @@ CLIENT_ID = "app_15347417c1994c92997e"
 WAITING_FOR_LICENSE = 1
 WAITING_FOR_ZIP = 2
 WAITING_FOR_REPO = 3
+WAITING_FOR_EDIT = 4
 
 
 
@@ -217,8 +218,12 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
             zip_ref.extractall(extract_dir)
 
         for root, _, files in os.walk(extract_dir):
+            # Never upload Python cache or compiled files.
+            files = [f for f in files if f != "__pycache__" and not f.endswith((".pyc", ".pyo"))]
             for file_name in files:
                 local_file_path = os.path.join(root, file_name)
+                if "__pycache__" in local_file_path.split(os.sep):
+                    continue
                 relative_path = os.path.relpath(local_file_path, extract_dir).replace("\\", "/")
                 
                 github_file_path = f"{target_path}/{relative_path}" if target_path else relative_path
@@ -255,6 +260,319 @@ async def handle_repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
+
+# =========================
+# GitHub A-Z management
+# =========================
+GITHUB_API = "https://api.github.com"
+
+
+def github_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_error(response):
+    try:
+        data = response.json()
+        return data.get("message", f"GitHub API error (HTTP {response.status_code})")
+    except ValueError:
+        return f"GitHub API error (HTTP {response.status_code})"
+
+
+def parse_repo(value):
+    value = value.strip().strip("/")
+    parts = value.split("/")
+    if len(parts) != 2 or not all(parts):
+        return None
+    return parts[0], parts[1]
+
+
+def github_ready():
+    return bool(GITHUB_TOKEN)
+
+
+async def github_guard(update: Update):
+    if not await require_license(update, update.get_bot().application.user_data if False else update.get_bot()):
+        return False
+    return True
+
+
+async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    if not github_ready():
+        await update.message.reply_text("❌ GITHUB_TOKEN Render Environment-এ পাওয়া যায়নি।")
+        return ConversationHandler.END
+    try:
+        r = requests.get(f"{GITHUB_API}/user/repos?per_page=100&sort=updated", headers=github_headers(), timeout=15)
+        if not r.ok:
+            await update.message.reply_text(f"❌ {github_error(r)}")
+            return ConversationHandler.END
+        items = r.json()
+        if not items:
+            await update.message.reply_text("📂 কোনো repository পাওয়া যায়নি।")
+            return ConversationHandler.END
+        lines = ["📚 Your GitHub Repositories:\n"]
+        for x in items[:100]:
+            visibility = "🔒 Private" if x.get("private") else "🌐 Public"
+            lines.append(f"• `{x['full_name']}` — {visibility}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except requests.RequestException as e:
+        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
+    return ConversationHandler.END
+
+
+async def create_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    if not github_ready():
+        await update.message.reply_text("❌ GITHUB_TOKEN Render Environment-এ পাওয়া যায়নি।")
+        return ConversationHandler.END
+    if not context.args or len(context.args) > 2:
+        await update.message.reply_text("Usage:\n/create_repo RepoName [private|public]\n\nExample:\n/create_repo my-project private")
+        return ConversationHandler.END
+    name = context.args[0]
+    private = len(context.args) == 2 and context.args[1].lower() == "private"
+    payload = {"name": name, "private": private, "auto_init": False}
+    try:
+        r = requests.post(f"{GITHUB_API}/user/repos", headers=github_headers(), json=payload, timeout=15)
+        if r.status_code == 201:
+            data = r.json()
+            await update.message.reply_text(f"✅ Repository created!\n\n📦 `{data['full_name']}`\n🔗 {data['html_url']}", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"❌ {github_error(r)}")
+    except requests.RequestException as e:
+        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
+    return ConversationHandler.END
+
+
+async def delete_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    if not github_ready():
+        await update.message.reply_text("❌ GITHUB_TOKEN Render Environment-এ পাওয়া যায়নি।")
+        return ConversationHandler.END
+    if len(context.args) != 2 or context.args[1].upper() != "CONFIRM":
+        await update.message.reply_text("⚠️ Repository permanently delete করতে:\n/delete_repo owner/repo CONFIRM")
+        return ConversationHandler.END
+    repo = parse_repo(context.args[0])
+    if not repo:
+        await update.message.reply_text("❌ Format: owner/repo")
+        return ConversationHandler.END
+    try:
+        r = requests.delete(f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}", headers=github_headers(), timeout=15)
+        if r.status_code == 204:
+            await update.message.reply_text(f"🗑️ `{repo[0]}/{repo[1]}` deleted successfully.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"❌ {github_error(r)}")
+    except requests.RequestException as e:
+        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
+    return ConversationHandler.END
+
+
+async def repo_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /repo_info owner/repo")
+        return ConversationHandler.END
+    repo = parse_repo(context.args[0])
+    if not repo:
+        await update.message.reply_text("❌ Format: owner/repo")
+        return ConversationHandler.END
+    try:
+        r = requests.get(f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}", headers=github_headers(), timeout=15)
+        if not r.ok:
+            await update.message.reply_text(f"❌ {github_error(r)}")
+            return ConversationHandler.END
+        d = r.json()
+        await update.message.reply_text(
+            f"📦 {d['full_name']}\n\n"
+            f"🔒 {'Private' if d['private'] else 'Public'}\n"
+            f"⭐ {d['stargazers_count']}\n"
+            f"🌿 Default branch: `{d['default_branch']}`\n"
+            f"📁 {d.get('size', 0)} KB\n"
+            f"🔗 {d['html_url']}", parse_mode="Markdown")
+    except requests.RequestException as e:
+        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
+    return ConversationHandler.END
+
+
+async def browse_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    if len(context.args) not in (1, 2):
+        await update.message.reply_text("Usage: /browse owner/repo [folder/path]")
+        return ConversationHandler.END
+    repo = parse_repo(context.args[0])
+    if not repo:
+        await update.message.reply_text("❌ Format: owner/repo")
+        return ConversationHandler.END
+    path = context.args[1] if len(context.args) == 2 else ""
+    try:
+        url = f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}/contents/{path}" if path else f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}/contents"
+        r = requests.get(url, headers=github_headers(), timeout=15)
+        if not r.ok:
+            await update.message.reply_text(f"❌ {github_error(r)}")
+            return ConversationHandler.END
+        data = r.json()
+        if isinstance(data, dict):
+            await update.message.reply_text(f"📄 `{data.get('path')}`\n🔗 {data.get('html_url')}", parse_mode="Markdown")
+            return ConversationHandler.END
+        lines = [f"📂 `{repo[0]}/{repo[1]}/{path}`" if path else f"📂 `{repo[0]}/{repo[1]}`", ""]
+        for x in data:
+            icon = "📁" if x.get("type") == "dir" else "📄"
+            lines.append(f"{icon} `{x.get('path')}`")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except requests.RequestException as e:
+        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
+    return ConversationHandler.END
+
+
+async def view_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /view_file owner/repo/path/to/file")
+        return ConversationHandler.END
+    repo = parse_repo(context.args[0])
+    if not repo:
+        await update.message.reply_text("❌ Format: owner/repo")
+        return ConversationHandler.END
+    path = context.args[1]
+    try:
+        r = requests.get(f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}/contents/{path}", headers=github_headers(), timeout=15)
+        if not r.ok:
+            await update.message.reply_text(f"❌ {github_error(r)}")
+            return ConversationHandler.END
+        d = r.json()
+        if d.get("encoding") != "base64":
+            await update.message.reply_text("❌ This file cannot be displayed as text.")
+            return ConversationHandler.END
+        content = base64.b64decode(d["content"]).decode("utf-8", errors="replace")
+        if len(content) > 3500:
+            content = content[:3500] + "\n... [truncated]"
+        await update.message.reply_text(f"📄 `{path}`\n\n```text\n{content}\n```", parse_mode="Markdown")
+    except (requests.RequestException, ValueError) as e:
+        await update.message.reply_text(f"❌ Could not read file: {e}")
+    return ConversationHandler.END
+
+
+async def edit_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /edit_file owner/repo path/to/file")
+        return ConversationHandler.END
+    repo = parse_repo(context.args[0])
+    if not repo:
+        await update.message.reply_text("❌ Format: owner/repo")
+        return ConversationHandler.END
+    context.user_data["edit_repo"] = f"{repo[0]}/{repo[1]}"
+    context.user_data["edit_path"] = context.args[1]
+    await update.message.reply_text("✏️ এখন নতুন file content পাঠাও। এই message-টাই পুরো file replace করবে।\n\n/cancel দিয়ে বাতিল করতে পারো।")
+    return WAITING_FOR_EDIT
+
+
+async def edit_file_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    repo = context.user_data.get("edit_repo")
+    path = context.user_data.get("edit_path")
+    if not repo or not path:
+        return ConversationHandler.END
+    try:
+        owner, name = repo.split("/", 1)
+        url = f"{GITHUB_API}/repos/{owner}/{name}/contents/{path}"
+        old = requests.get(url, headers=github_headers(), timeout=15)
+        sha = old.json().get("sha") if old.status_code == 200 else None
+        payload = {"message": f"Edit {path} via Telegram Bot", "content": base64.b64encode((update.message.text or "").encode()).decode()}
+        if sha:
+            payload["sha"] = sha
+        r = requests.put(url, headers=github_headers(), json=payload, timeout=15)
+        if r.status_code in (200, 201):
+            await update.message.reply_text(f"✅ `{path}` updated successfully.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"❌ {github_error(r)}")
+    except requests.RequestException as e:
+        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
+    finally:
+        context.user_data.pop("edit_repo", None)
+        context.user_data.pop("edit_path", None)
+    return ConversationHandler.END
+
+
+async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    if len(context.args) != 3 or context.args[2].upper() != "CONFIRM":
+        await update.message.reply_text("⚠️ File permanently delete করতে:\n/delete_file owner/repo path/to/file CONFIRM")
+        return ConversationHandler.END
+    repo = parse_repo(context.args[0])
+    if not repo:
+        await update.message.reply_text("❌ Format: owner/repo")
+        return ConversationHandler.END
+    path = context.args[1]
+    try:
+        url = f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}/contents/{path}"
+        old = requests.get(url, headers=github_headers(), timeout=15)
+        if old.status_code != 200:
+            await update.message.reply_text(f"❌ {github_error(old)}")
+            return ConversationHandler.END
+        sha = old.json().get("sha")
+        r = requests.delete(url, headers=github_headers(), json={"message": f"Delete {path} via Telegram Bot", "sha": sha}, timeout=15)
+        if r.status_code == 200:
+            await update.message.reply_text(f"🗑️ `{path}` deleted successfully.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"❌ {github_error(r)}")
+    except requests.RequestException as e:
+        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
+    return ConversationHandler.END
+
+
+async def set_visibility(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    if len(context.args) != 2 or context.args[1].lower() not in ("public", "private"):
+        await update.message.reply_text("Usage: /visibility owner/repo public|private")
+        return ConversationHandler.END
+    repo = parse_repo(context.args[0])
+    if not repo:
+        await update.message.reply_text("❌ Format: owner/repo")
+        return ConversationHandler.END
+    try:
+        r = requests.patch(f"{GITHUB_API}/repos/{repo[0]}/{repo[1]}", headers=github_headers(), json={"private": context.args[1].lower() == "private"}, timeout=15)
+        if r.ok:
+            await update.message.reply_text(f"✅ `{repo[0]}/{repo[1]}` is now {context.args[1].lower()}.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"❌ {github_error(r)}")
+    except requests.RequestException as e:
+        await update.message.reply_text(f"❌ GitHub connection failed: {e}")
+    return ConversationHandler.END
+
+
+async def github_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_license(update, context):
+        return WAITING_FOR_LICENSE
+    await update.message.reply_text(
+        "🐙 GitHub Manager\n\n"
+        "/repos — list repositories\n"
+        "/create_repo name [private|public] — create repo\n"
+        "/delete_repo owner/repo CONFIRM — delete repo\n"
+        "/repo_info owner/repo — repo details\n"
+        "/browse owner/repo [folder] — browse files\n"
+        "/view_file owner/repo path — view file\n"
+        "/edit_file owner/repo path — replace file content\n"
+        "/delete_file owner/repo path CONFIRM — delete file\n"
+        "/visibility owner/repo public|private — change visibility\n\n"
+        "📦 Send a ZIP normally to upload/update an entire project."
+    )
+    return ConversationHandler.END
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("প্রসেস বাতিল করা হয়েছে। ❎")
     return ConversationHandler.END
@@ -265,6 +583,17 @@ def main():
     server_thread.start()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # GitHub management commands are added only once here.
+    # Existing ZIP upload/license flow remains unchanged.
+    github_commands = [
+        ("github", github_help), ("repos", repos), ("create_repo", create_repo),
+        ("delete_repo", delete_repo), ("repo_info", repo_info), ("browse", browse_repo),
+        ("view_file", view_file), ("edit_file", edit_file_start), ("delete_file", delete_file),
+        ("visibility", set_visibility),
+    ]
+    for command, handler in github_commands:
+        app.add_handler(CommandHandler(command, handler))
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -282,6 +611,9 @@ def main():
             ],
             WAITING_FOR_REPO: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_repo_info),
+            ],
+            WAITING_FOR_EDIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_file_finish),
             ],
         },
         fallbacks=[
