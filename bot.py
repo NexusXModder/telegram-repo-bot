@@ -160,6 +160,15 @@ def repo_picker_keyboard(repos, page=0, action="upload"):
         InlineKeyboardButton("❌ Cancel", callback_data="gh_cancel"),
     ])
 
+    if action == "upload":
+        keyboard.append([
+            InlineKeyboardButton("🧹 Replace all files mode", callback_data="mode:replace"),
+        ])
+    elif action == "replace":
+        keyboard.append([
+            InlineKeyboardButton("📦 Normal upload mode", callback_data="mode:upload"),
+        ])
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -186,6 +195,7 @@ async def show_repo_picker(
             else:
                 labels = {
                     "upload": "📦 Choose where to upload the ZIP:",
+                    "replace": "🧹 Choose repo to REPLACE all its files with the ZIP:",
                     "info": "ℹ️ Choose a repository:",
                     "browse": "📂 Choose a repository to browse:",
                     "view": "👁️ Choose a repository:",
@@ -495,6 +505,171 @@ async def upload_selected_repo(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ============================================================
+# ZIP -> GitHub replace (delete everything, then upload)
+# ============================================================
+def github_post(url, payload):
+    response = requests.post(url, headers=github_headers(), json=payload, timeout=60)
+    if response.status_code not in (200, 201):
+        raise RuntimeError(github_error(response))
+    return response.json()
+
+
+async def replace_confirm_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, repo, index_text):
+    query = update.callback_query
+    await query.edit_message_text(
+        "⚠️ Replace ALL files?\n\n"
+        f"Repository: {repo.get('full_name')}\n\n"
+        "Every file currently in this repository will be removed, "
+        "then the ZIP contents will be pushed.\n\n"
+        "Old files stay in git history, but they will be gone from the branch.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧹 Yes, replace everything", callback_data=f"replace_yes:{index_text}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="gh_cancel")],
+        ]),
+    )
+    return WAITING_FOR_REPO
+
+
+async def replace_selected_repo(update: Update, context: ContextTypes.DEFAULT_TYPE, repo):
+    query = update.callback_query
+    zip_path = context.user_data.get("zip_path")
+
+    if not zip_path or not os.path.exists(zip_path):
+        await query.edit_message_text(
+            "❌ ZIP file is no longer available. Please send it again."
+        )
+        return WAITING_FOR_ZIP
+
+    if not GITHUB_TOKEN:
+        await query.edit_message_text(
+            "❌ GITHUB_TOKEN is not configured on the server."
+        )
+        return WAITING_FOR_ZIP
+
+    repo_fullname = repo.get("full_name")
+    if not repo_fullname or "/" not in repo_fullname:
+        await query.edit_message_text("❌ Invalid repository information.")
+        return WAITING_FOR_REPO
+
+    branch = repo.get("default_branch") or "main"
+    base = f"https://api.github.com/repos/{repo_fullname}"
+    headers = github_headers()
+
+    await query.edit_message_text(
+        f"🧹 Replacing all files in `{repo_fullname}`...\n\nPlease wait ⏳",
+        parse_mode="Markdown",
+    )
+
+    extract_dir = tempfile.mkdtemp(prefix=f"nexus_replace_{update.effective_user.id}_")
+    skipped = 0
+
+    try:
+        # Read the branch head first. An empty repository has no branch yet,
+        # so there is nothing to delete and a normal upload gives the same result.
+        ref = requests.get(f"{base}/git/ref/heads/{branch}", headers=headers, timeout=20)
+        if ref.status_code == 404:
+            return await upload_selected_repo(update, context, repo)
+        if ref.status_code != 200:
+            raise RuntimeError(github_error(ref))
+        head_sha = ref.json()["object"]["sha"]
+
+        safe_extract_zip(zip_path, extract_dir)
+
+        entries = []
+        for root, _, files in os.walk(extract_dir):
+            for file_name in files:
+                local = os.path.join(root, file_name)
+                relative = os.path.relpath(local, extract_dir).replace("\\", "/")
+                parts = relative.split("/")
+
+                if (
+                    "__pycache__" in parts
+                    or file_name.endswith((".pyc", ".pyo"))
+                    or ".git" in parts
+                ):
+                    skipped += 1
+                    continue
+
+                with open(local, "rb") as f:
+                    raw = f.read()
+
+                blob = github_post(
+                    f"{base}/git/blobs",
+                    {"content": base64.b64encode(raw).decode(), "encoding": "base64"},
+                )
+                entries.append({
+                    "path": relative,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob["sha"],
+                })
+
+        if not entries:
+            raise RuntimeError("The ZIP does not contain any files to upload. Nothing was changed.")
+
+        # A tree created without base_tree replaces the whole tree, so old files are dropped.
+        tree = github_post(f"{base}/git/trees", {"tree": entries})
+        commit = github_post(
+            f"{base}/git/commits",
+            {
+                "message": "Replace repository contents via Telegram Bot",
+                "tree": tree["sha"],
+                "parents": [head_sha],
+            },
+        )
+
+        # Moving the branch is the only step that changes the repo, so it runs last.
+        moved = requests.patch(
+            f"{base}/git/refs/heads/{branch}",
+            headers=headers,
+            json={"sha": commit["sha"], "force": False},
+            timeout=30,
+        )
+        if moved.status_code != 200:
+            raise RuntimeError(github_error(moved))
+
+        await query.edit_message_text(
+            "✅ Replace complete!\n\n"
+            f"📦 Repository: `{repo_fullname}`\n"
+            f"📄 Files now in repo: {len(entries)}\n"
+            f"⏭️ Skipped: {skipped}\n"
+            f"🔗 Commit: `{commit['sha'][:7]}`",
+            parse_mode="Markdown",
+        )
+
+    except zipfile.BadZipFile:
+        await query.edit_message_text("❌ Invalid or corrupted ZIP file. Repository was not changed.")
+    except requests.RequestException as exc:
+        print(f"[GITHUB REPLACE NETWORK ERROR] {type(exc).__name__}: {exc}")
+        await query.edit_message_text(
+            "❌ Could not connect to GitHub while replacing. Repository was not changed."
+        )
+    except Exception as exc:
+        print(f"[GITHUB REPLACE ERROR] {type(exc).__name__}: {exc}")
+        await query.edit_message_text(
+            f"❌ Replace failed, repository was not changed:\n\n{type(exc).__name__}: {exc}"
+        )
+    finally:
+        zip_path = context.user_data.pop("zip_path", None)
+        temp_dir = context.user_data.pop("zip_temp_dir", None)
+        context.user_data.pop("zip_name", None)
+        context.user_data.pop("github_repos", None)
+
+        if zip_path and os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        shutil.rmtree(extract_dir, ignore_errors=True)
+
+    return WAITING_FOR_ZIP
+
+
+# ============================================================
 # GitHub manager UI
 # ============================================================
 def github_menu_markup():
@@ -654,6 +829,23 @@ async def github_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             True,
         )
 
+    if data.startswith("mode:"):
+        mode = data.split(":", 1)[1]
+        if mode not in ("upload", "replace"):
+            return WAITING_FOR_REPO
+        return await show_repo_picker(update, context, mode, 0, True)
+
+    if data.startswith("replace_yes:"):
+        index_text = data.split(":", 1)[1]
+        try:
+            repo = (context.user_data.get("github_repos") or [])[int(index_text)]
+        except (ValueError, IndexError, TypeError):
+            await query.edit_message_text(
+                "❌ Repository selection expired. Please open /github again."
+            )
+            return WAITING_FOR_REPO
+        return await replace_selected_repo(update, context, repo)
+
     if data.startswith("pick:"):
         _, action, index_text = data.split(":", 2)
 
@@ -669,6 +861,9 @@ async def github_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "upload":
             return await upload_selected_repo(update, context, repo)
+
+        if action == "replace":
+            return await replace_confirm_prompt(update, context, repo, index_text)
 
         if action == "info":
             try:
@@ -1268,7 +1463,7 @@ def main():
                 ),
                 CallbackQueryHandler(
                     github_callback,
-                    pattern=r"^(gh_|page:|refresh:|pick:|setvis:|confirm:|browse:|confirm_delete_file:).*",
+                    pattern=r"^(gh_|page:|refresh:|pick:|setvis:|confirm:|browse:|confirm_delete_file:|mode:|replace_yes:).*",
                 ),
                 MessageHandler(filters.Document.ALL, handle_zip),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, invalid_zip_input),
@@ -1280,7 +1475,7 @@ def main():
                 ),
                 CallbackQueryHandler(
                     github_callback,
-                    pattern=r"^(gh_|page:|refresh:|pick:|setvis:|confirm:|browse:|confirm_delete_file:).*",
+                    pattern=r"^(gh_|page:|refresh:|pick:|setvis:|confirm:|browse:|confirm_delete_file:|mode:|replace_yes:).*",
                 ),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, github_text_input),
                 MessageHandler(filters.Document.ALL, invalid_zip_input),
