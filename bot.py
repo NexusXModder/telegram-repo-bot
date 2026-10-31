@@ -110,6 +110,7 @@ def get_repositories():
 # Start
 # ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("zip_mode", None)
     await update.message.reply_text(
         "✅ Bot is ready.\n\n"
         "Send your ZIP file to upload, or use /github for GitHub Manager."
@@ -124,6 +125,11 @@ def repo_picker_keyboard(repos, page=0, action="upload"):
     start = page * REPO_PAGE_SIZE
     page_repos = repos[start:start + REPO_PAGE_SIZE]
     keyboard = []
+
+    if action == "upload":
+        keyboard.append([InlineKeyboardButton("🧹 Replace all files mode", callback_data="mode:replace")])
+    elif action == "replace":
+        keyboard.append([InlineKeyboardButton("📦 Normal upload mode", callback_data="mode:upload")])
 
     for index, repo in enumerate(page_repos, start=start):
         lock = "🔒" if repo.get("private") else "🌐"
@@ -160,14 +166,6 @@ def repo_picker_keyboard(repos, page=0, action="upload"):
         InlineKeyboardButton("❌ Cancel", callback_data="gh_cancel"),
     ])
 
-    if action == "upload":
-        keyboard.append([
-            InlineKeyboardButton("🧹 Replace all files mode", callback_data="mode:replace"),
-        ])
-    elif action == "replace":
-        keyboard.append([
-            InlineKeyboardButton("📦 Normal upload mode", callback_data="mode:upload"),
-        ])
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -303,7 +301,8 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🐙 Loading your GitHub repositories..."
             )
 
-            result = await show_repo_picker(update, context, "upload")
+            mode = "replace" if context.user_data.get("zip_mode") == "replace" else "upload"
+            result = await show_repo_picker(update, context, mode)
 
             # If repository loading failed, keep the ZIP so the user can refresh/retry.
             return result
@@ -489,6 +488,7 @@ async def upload_selected_repo(update: Update, context: ContextTypes.DEFAULT_TYP
         temp_dir = context.user_data.pop("zip_temp_dir", None)
         context.user_data.pop("zip_name", None)
         context.user_data.pop("github_repos", None)
+        context.user_data.pop("zip_mode", None)
 
         if zip_path and os.path.exists(zip_path):
             try:
@@ -654,6 +654,7 @@ async def replace_selected_repo(update: Update, context: ContextTypes.DEFAULT_TY
         temp_dir = context.user_data.pop("zip_temp_dir", None)
         context.user_data.pop("zip_name", None)
         context.user_data.pop("github_repos", None)
+        context.user_data.pop("zip_mode", None)
 
         if zip_path and os.path.exists(zip_path):
             try:
@@ -675,6 +676,7 @@ async def replace_selected_repo(update: Update, context: ContextTypes.DEFAULT_TY
 def github_menu_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 Upload ZIP", callback_data="gh_upload")],
+        [InlineKeyboardButton("🧹 Replace repo with ZIP", callback_data="gh_replace")],
         [InlineKeyboardButton("📚 Repositories", callback_data="gh_repos")],
         [InlineKeyboardButton("➕ Create Repo", callback_data="gh_create")],
         [
@@ -736,6 +738,7 @@ async def github_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "gh_cancel":
+        context.user_data.pop("zip_mode", None)
         await query.edit_message_text("❎ GitHub action cancelled.")
         context.user_data.pop("github_mode", None)
         return WAITING_FOR_ZIP
@@ -763,7 +766,17 @@ async def github_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return WAITING_FOR_REPO
 
+    if data == "gh_replace":
+        context.user_data["zip_mode"] = "replace"
+        await query.edit_message_text(
+            "🧹 Send your ZIP file now.\n\n"
+            "After you pick a repository, ALL its existing files are deleted "
+            "and replaced with the ZIP contents. You will be asked to confirm."
+        )
+        return WAITING_FOR_ZIP
+
     if data == "gh_upload":
+        context.user_data.pop("zip_mode", None)
         # Make sure an old ZIP does not accidentally get reused.
         old_zip = context.user_data.pop("zip_path", None)
         old_temp = context.user_data.pop("zip_temp_dir", None)
@@ -833,6 +846,7 @@ async def github_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = data.split(":", 1)[1]
         if mode not in ("upload", "replace"):
             return WAITING_FOR_REPO
+        context.user_data["zip_mode"] = mode
         return await show_repo_picker(update, context, mode, 0, True)
 
     if data.startswith("replace_yes:"):
@@ -1520,3 +1534,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
